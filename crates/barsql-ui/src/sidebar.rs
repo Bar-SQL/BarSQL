@@ -5,7 +5,7 @@ use barsql_app::ConnectionFolder;
 use barsql_core::{ConnectionConfig, DriverType, SavedQuery};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -15,7 +15,7 @@ use crate::connections_panel::{ConnectionsEvent, ConnectionsPanel, connection_su
 use crate::history_panel::{HistoryEvent, HistoryPanel};
 use crate::i18n::t;
 use crate::saved_panel::{SavedEvent, SavedPanel};
-use crate::schema_tree::{SchemaTree, SchemaTreeEvent, TableChange};
+use crate::schema_tree::{ActiveTable, SchemaTree, SchemaTreeEvent, TableChange};
 use crate::state;
 use crate::tokens::{ICON_SM, ICON_XS, RADIUS, TEXT_BASE, TEXT_SM};
 
@@ -34,6 +34,7 @@ pub enum SidebarEvent {
     // Opens a new tab for SQL from the tree, like SELECT, COUNT or DDL. `run` runs it there, as system views do.
     OpenQuery { connection: ConnectionConfig, sql: String, title: String, run: bool },
     Browse { connection: ConnectionConfig, schema: String, table: String },
+    OpenDiagram { connection: ConnectionConfig, schema: String },
     // SQL from history. Goes into the connection's plain query tab.
     OpenSql { connection: ConnectionConfig, sql: String },
     OpenSaved(SavedQuery),
@@ -83,6 +84,10 @@ impl Sidebar {
                     SchemaTreeEvent::Browse { schema, table } => {
                         let Some(connection) = this.selected().cloned() else { return };
                         SidebarEvent::Browse { connection, schema: schema.clone(), table: table.clone() }
+                    }
+                    SchemaTreeEvent::OpenDiagram { schema } => {
+                        let Some(connection) = this.selected().cloned() else { return };
+                        SidebarEvent::OpenDiagram { connection, schema: schema.clone() }
                     }
                     SchemaTreeEvent::OpenScript { connection, sql, title } => SidebarEvent::OpenQuery {
                         connection: (**connection).clone(),
@@ -199,6 +204,13 @@ impl Sidebar {
         }
     }
 
+    // From the status bar.
+    pub(crate) fn open_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.switcher_open {
+            self.toggle_switcher(window, cx);
+        }
+    }
+
     // A click outside closes it, but not one on a popup the panel opened. A row's context menu acts on
     // mouse-up, after this handler. The panel shrinks to the height cap, and its list scrolls.
     fn switcher_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -278,7 +290,21 @@ impl Sidebar {
         }
     }
 
-    fn edit_connection(&mut self, config: Option<ConnectionConfig>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn has_connections(&self) -> bool {
+        !self.connections.is_empty()
+    }
+
+    // The welcome screen's New connection.
+    pub fn add_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_connection(None, window, cx);
+    }
+
+    pub(crate) fn edit_connection(
+        &mut self,
+        config: Option<ConnectionConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let this = cx.entity().downgrade();
         connection_dialog::open(config, window, cx, move |_, _, cx| {
             let _ = this.update(cx, |sidebar, cx| sidebar.reload_connections(cx));
@@ -323,6 +349,10 @@ impl Sidebar {
             self.sync_tree(cx);
             cx.notify();
         }
+    }
+
+    pub fn set_active_table(&mut self, table: Option<ActiveTable>, cx: &mut Context<Self>) {
+        self.schema_tree.update(cx, |tree, cx| tree.set_active_table(table, cx));
     }
 
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
@@ -437,20 +467,9 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // Without connections the welcome screen leads, and New connection sits at the top, so this only says so.
         let body = if self.connections.is_empty() {
-            v_flex()
-                .gap_3()
-                .child(self.empty(t(cx, "sidebar.noConnectionsYet"), cx))
-                .child(
-                    div().px_4().child(
-                        Button::new("add-connection")
-                            .primary()
-                            .small()
-                            .label(t(cx, "sidebar.addConnectionButton"))
-                            .on_click(cx.listener(|this, _, window, cx| this.edit_connection(None, window, cx))),
-                    ),
-                )
-                .into_any_element()
+            self.empty(t(cx, "sidebar.noConnectionsYet"), cx).into_any_element()
         } else {
             match self.panel {
                 Panel::Schema => self.schema_tree.clone().into_any_element(),
@@ -483,7 +502,7 @@ impl Render for Sidebar {
                             .size_full(),
                     ),
             )
-            .child(self.tabs(cx))
+            .when(!self.connections.is_empty(), |el| el.child(self.tabs(cx)))
             .child(div().flex_1().min_h_0().child(body))
             .when(self.switcher_open && !self.connections.is_empty(), |el| el.child(self.switcher_menu(window, cx)))
     }

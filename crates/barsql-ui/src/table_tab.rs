@@ -7,6 +7,7 @@ use barsql_core::{ConnectionConfig, Row, RowDelete, RowUpdate, TableDataRequest,
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputMode, InputState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -16,8 +17,8 @@ use crate::cell_viewer;
 use crate::completion::{self, Completion};
 use crate::dialogs;
 use crate::form::{self, ToolButton};
-use crate::grid::{self, Grid, GridEvent, RowRef, TableOverlay};
-use crate::i18n::{I18n, t, t_count, t_with};
+use crate::grid::{self, Choices, Grid, GridEvent, RowRef, TableOverlay};
+use crate::i18n::{I18n, count, t, t_count, t_with};
 use crate::results::ShownError;
 use crate::schema;
 use crate::sql_language::FilterCompletion;
@@ -28,6 +29,14 @@ use crate::tokens::{ICON_SM, TEXT_SM};
 
 // Next page loads on scroll.
 const PAGE_SIZE: usize = 100;
+
+// The rows the applied filter lets through, once asked for. A replacing load forgets it.
+enum Total {
+    Unknown,
+    // Held so the count keeps going. Dropping it, as a new filter does, drops the answer.
+    Counting { _task: Task<()> },
+    Known(i64),
+}
 
 pub enum TableTabEvent {
     // Filter, sort or hidden columns changed, so the session needs saving.
@@ -55,12 +64,15 @@ pub struct TableTab {
     staging: Staging,
     has_more: bool,
     page_rows: usize,
+    total: Total,
     replace: bool,
     loaded: bool,
     loading: Option<Task<()>>,
     applying: bool,
     error: Option<ShownError>,
     foreign: HashMap<String, (String, String)>,
+    // By column name, as `foreign` is.
+    choices: HashMap<String, Choices>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -115,17 +127,19 @@ impl TableTab {
             staging: Staging::default(),
             has_more: false,
             page_rows: 0,
+            total: Total::Unknown,
             replace: true,
             loaded: false,
             loading: None,
             applying: false,
             error: None,
             foreign: HashMap::new(),
+            choices: HashMap::new(),
             _subscriptions: subscriptions,
         };
         // Like a query tab, so the sidebar tree fills when the app starts on a table view.
         schema::ensure_loaded(&this.connection.id, this.connection.driver.clone(), cx);
-        this.load_foreign_keys(cx);
+        this.load_columns(cx);
         this.fetch(0, true, window, cx);
         this
     }
@@ -204,15 +218,51 @@ impl TableTab {
         self.grid.read(cx).focused_row()
     }
 
-    pub fn status(&self, cx: &App) -> (SharedString, bool) {
-        match &self.error {
-            Some(error) => (error.message.clone(), true),
-            None if self.loading.is_some() => (t(cx, "tableView.loading"), false),
-            None => {
-                let rows = self.grid.read(cx).set().rows().to_string();
-                (t_with(cx, "tableView.rowCount", &[("count", &rows)]), false)
+    // A page on its way, for the status bar.
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    // "37 rows" once the whole table is loaded, "100 rows loaded" while more pages wait, and "100 of 3,000 rows" once
+    // counted, for the grid's toolbar.
+    fn rows_label(&self, cx: &App) -> SharedString {
+        let loaded = self.grid.read(cx).set().rows();
+        let rows = count(cx, loaded);
+        match (&self.total, self.has_more) {
+            (Total::Known(total), true) => {
+                let vars = [("loaded", rows.as_str()), ("total", &count(cx, (*total).max(0) as usize))];
+                t_count(cx, "tableView.rowsOf", *total, &vars)
             }
+            (_, true) => t_count(cx, "tableView.rowCount", loaded as i64, &[("rows", &rows)]),
+            (_, false) => t_count(cx, "tableView.rowsAll", loaded as i64, &[("rows", &rows)]),
         }
+    }
+
+    // Counts what the filter lets through, on a session of its own as the tree's Count rows does.
+    pub(crate) fn count_total(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.total, Total::Counting { .. }) {
+            return;
+        }
+        let bar = state::bar(cx);
+        let (id, schema, table) = (self.connection.id.clone(), self.schema.clone(), self.table.clone());
+        let filter = self.applied_filter.trim().to_string();
+        let counted = state::spawn(cx, async move { bar.count_matching(&id, &schema, &table, &filter).await });
+        let task = cx.spawn(async move |this, cx| {
+            let counted = counted.await;
+            let _ = this.update(cx, |this, cx| {
+                this.total = match counted {
+                    Some(Ok(total)) => Total::Known(total),
+                    Some(Err(error)) => {
+                        toast::error_in(t(cx, "errors.countFailed"), error.message, cx);
+                        Total::Unknown
+                    }
+                    None => Total::Unknown,
+                };
+                cx.notify();
+            });
+        });
+        self.total = Total::Counting { _task: task };
+        cx.notify();
     }
 
     // Called when the schema tree renames the table or changes its columns or rows. Staged edits no longer
@@ -254,7 +304,8 @@ impl TableTab {
         !self.connection.read_only && !self.primary_keys.is_empty()
     }
 
-    fn load_foreign_keys(&mut self, cx: &mut Context<Self>) {
+    // The catalog's word on each column: where its foreign key leads, and the values it takes from a list.
+    fn load_columns(&mut self, cx: &mut Context<Self>) {
         let load = schema::columns(&self.connection.id, &self.schema, &self.table, cx);
         cx.spawn(async move |this, cx| {
             let Ok(columns) = load.await else { return };
@@ -263,6 +314,13 @@ impl TableTab {
                     .iter()
                     .filter(|c| c.is_foreign && !c.foreign_table.is_empty())
                     .map(|c| (c.name.clone(), (c.foreign_table.clone(), c.foreign_column.clone())))
+                    .collect();
+                this.choices = columns
+                    .iter()
+                    .filter(|c| !c.enum_values.is_empty())
+                    .map(|c| {
+                        (c.name.clone(), Choices { values: c.enum_values.clone().into(), nullable: c.is_nullable })
+                    })
                     .collect();
                 this.sync_overlay(cx);
             })
@@ -287,6 +345,10 @@ impl TableTab {
     fn fetch(&mut self, offset: usize, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.error = None;
         self.replace = replace;
+        // A new filter, a refresh or applied edits may change how many rows there are.
+        if replace {
+            self.total = Total::Unknown;
+        }
         self.page_rows = 0;
         self.grid.update(cx, |grid, _| grid.set_loading(true));
         let bar = state::bar(cx);
@@ -391,12 +453,15 @@ impl TableTab {
         let foreign =
             self.foreign.iter().filter_map(|(column, (table, _))| Some((column_ix(column)?, table.clone()))).collect();
         let primary = self.primary_keys.iter().filter_map(|name| column_ix(name)).collect();
+        let choices =
+            self.choices.iter().filter_map(|(column, choices)| Some((column_ix(column)?, choices.clone()))).collect();
         let overlay = TableOverlay {
             staged: Arc::new(staged),
             deleted,
             sort: sort.map(|column| (column, self.order_desc)),
             foreign,
             primary,
+            choices,
             editable: self.editable(),
         };
         self.grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
@@ -788,20 +853,42 @@ impl TableTab {
 
     fn body(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(error) = &self.error {
-            return error.card(None, cx).into_any_element();
+            return error.card(None, None, cx).into_any_element();
         }
         if !self.loaded {
             let key = if self.loading.is_some() { "tableView.loading" } else { "results.noResults" };
             return div().p_4().text_color(cx.theme().muted_foreground).child(t(cx, key)).into_any_element();
         }
-        let rows = self.grid.read(cx).set().rows().to_string();
-        let mut meta = t_with(cx, "tableView.rowCount", &[("count", &rows)]).to_string();
+        let mut meta = self.rows_label(cx).to_string();
+        if matches!(self.total, Total::Counting { .. }) {
+            meta = format!("{meta} · {}", t(cx, "tableView.counting"));
+        }
         if self.loading.is_some() || self.applying {
             meta = format!("{meta} · {}", t(cx, "tableView.loading"));
         }
+        // Count reads as the rest of the line it completes, "100 rows loaded · Count all", a link like the About box's.
+        let count_link = (self.has_more && matches!(self.total, Total::Unknown)).then(|| {
+            let tip = t(cx, "tableView.countRowsTooltip");
+            h_flex()
+                .ml(rems(0.308))
+                .gap(rems(0.308))
+                .child("·")
+                .child(
+                    div()
+                        .id("count-rows")
+                        .debug_selector(|| "count-rows".into())
+                        .text_color(cx.theme().primary)
+                        .cursor_pointer()
+                        .hover(|style| style.underline())
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .on_click(cx.listener(|this, _, _, cx| this.count_total(cx)))
+                        .child(t(cx, "tableView.countRows")),
+                )
+                .into_any_element()
+        });
         v_flex()
             .size_full()
-            .child(grid::toolbar(&self.grid, meta.into(), None, true, cx))
+            .child(grid::toolbar(&self.grid, meta.into(), count_link, None, true, cx))
             .child(div().flex_1().min_h_0().child(self.grid.clone()))
             .into_any_element()
     }

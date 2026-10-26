@@ -1,19 +1,26 @@
+use std::ops::Range;
+use std::rc::Rc;
+
 use barsql_core::{ConnectionConfig, SavedQuery};
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollbarAxis;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use jiff::Timestamp;
 
 use crate::dialogs::{self, Confirm, Prompt};
 use crate::form;
 use crate::history_panel::Scope;
+use crate::hover_card::joined;
 use crate::i18n::{I18n, t, t_with};
-use crate::list_nav::{self, LIST_INSET, ListNav, NavDelete, NavDown, NavFirst, NavLast, NavOpen, NavUp, ROW_INSET};
-use crate::relative_time::one_line_preview;
+use crate::list_nav::{
+    self, LIST_INSET, ListNav, NavDelete, NavDown, NavFirst, NavLast, NavOpen, NavRename, NavUp, ROW_INSET,
+};
+use crate::relative_time::{format_relative_time, one_line_preview};
 use crate::saved_queries::{self, SORT_KEY, SavedQueries, SavedSort};
 use crate::scrollbars::HoverScrollbar as _;
 use crate::state::{self, set_setting, setting};
@@ -33,7 +40,8 @@ pub struct SavedPanel {
     sort: SavedSort,
     filter: Entity<InputState>,
     needle: String,
-    nav: ListNav,
+    // The list builds only the rows on screen.
+    nav: ListNav<UniformListScrollHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -63,7 +71,7 @@ impl SavedPanel {
             sort: SavedSort::parse(&setting(cx, SORT_KEY).unwrap_or_default()),
             filter,
             needle: String::new(),
-            nav: ListNav::new(cx),
+            nav: ListNav::with_scroll(UniformListScrollHandle::new(), cx),
             _subscriptions: subscriptions,
         }
     }
@@ -269,14 +277,22 @@ impl SavedPanel {
         self.visible(cx).into_iter().find(|query| query.id == id).cloned()
     }
 
-    fn render_row(&self, ix: usize, query: &SavedQuery, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(
+        &self,
+        ix: usize,
+        query: &SavedQuery,
+        now_ms: i64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let ring = self.nav.ringed(&query.id, window);
         let theme = cx.theme().clone();
         let pinned = saved_queries::pinned(cx).contains(&query.id);
         let connection = (self.scope == Scope::All)
             .then(|| self.connections.iter().find(|c| c.id == query.connection_id))
             .flatten()
-            .map(|c| c.name.clone());
+            .map(|c| c.name.as_str());
+        let meta = row_meta(query, self.sort, connection, cx.global::<I18n>().lang(), now_ms);
         let menu = self.row_menu(query, pinned, cx);
         let (open, pin_id, rename, delete) = (query.clone(), query.id.clone(), query.clone(), query.clone());
         h_flex()
@@ -311,8 +327,8 @@ impl SavedPanel {
                                     .font_semibold()
                                     .child(query.name.clone()),
                             )
-                            .children(connection.map(|name| {
-                                div().flex_none().text_size(TEXT_2XS).text_color(theme.muted_foreground).child(name)
+                            .children(meta.map(|meta| {
+                                div().flex_none().text_size(TEXT_2XS).text_color(theme.muted_foreground).child(meta)
                             })),
                     )
                     .child(
@@ -329,21 +345,20 @@ impl SavedPanel {
                 self.nav
                     .hover_actions("saved-row", ROW_INSET, LIST_INSET, window, cx)
                     .child(
-                        Button::new(SharedString::from(format!("saved-pin-{ix}")))
-                            .small()
-                            .debug_selector(move || format!("saved-pin-{ix}"))
-                            .icon(Icon::new(if pinned { Lucide::PinOff } else { Lucide::Pin }))
-                            .tooltip(t(cx, if pinned { "sidebar.unpin" } else { "sidebar.pin" }))
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                saved_queries::toggle_pin(&pin_id, cx);
-                            }),
+                        list_nav::row_button(
+                            SharedString::from(format!("saved-pin-{ix}")),
+                            if pinned { Lucide::PinOff } else { Lucide::Pin },
+                        )
+                        .debug_selector(move || format!("saved-pin-{ix}"))
+                        .tooltip(t(cx, if pinned { "sidebar.unpin" } else { "sidebar.pin" }))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            saved_queries::toggle_pin(&pin_id, cx);
+                        }),
                     )
                     .child(
-                        Button::new(SharedString::from(format!("saved-rename-{ix}")))
-                            .small()
+                        list_nav::row_button(SharedString::from(format!("saved-rename-{ix}")), Lucide::SquarePen)
                             .debug_selector(move || format!("saved-rename-{ix}"))
-                            .icon(Icon::new(Lucide::SquarePen))
                             .tooltip(t(cx, "tooltip.renameSavedQueryBtn"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -351,12 +366,10 @@ impl SavedPanel {
                             })),
                     )
                     .child(
-                        Button::new(SharedString::from(format!("saved-delete-{ix}")))
-                            .small()
+                        list_nav::row_button(SharedString::from(format!("saved-delete-{ix}")), Lucide::Trash)
                             .danger()
                             .outline()
                             .debug_selector(move || format!("saved-delete-{ix}"))
-                            .icon(Icon::new(Lucide::Trash))
                             .tooltip(t(cx, "tooltip.deleteSavedQuery"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -388,18 +401,30 @@ impl SavedPanel {
     }
 }
 
+// The connection in the All scope, and the query's age when sorted by a date.
+fn row_meta(query: &SavedQuery, sort: SavedSort, connection: Option<&str>, lang: &str, now_ms: i64) -> Option<String> {
+    let date = match sort {
+        SavedSort::Name => "",
+        SavedSort::UpdatedAt => &query.updated_at,
+        SavedSort::CreatedAt => &query.created_at,
+    };
+    let meta = joined([connection.unwrap_or_default().to_string(), format_relative_time(date, lang, now_ms)]);
+    (!meta.is_empty()).then_some(meta)
+}
+
 impl Render for SavedPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let field = div()
             .debug_selector(|| "saved-filter".into())
             .child(form::filter_input(&self.filter, window, cx).cleanable(true));
         let filter_bar = form::filter_bar(field, cx).child(self.options_menu(cx));
-        let visible: Vec<SavedQuery> = self.visible(cx).into_iter().cloned().collect();
+        let shown: Rc<[SavedQuery]> = self.visible(cx).into_iter().cloned().collect();
+        let now_ms = Timestamp::now().as_millisecond();
         let body = if saved_queries::list(cx).is_empty() {
             form::empty_state(Some(Icon::new(Lucide::Bookmark)), t(cx, "sidebar.noSaved"), cx)
                 .child(div().text_size(TEXT_XS).child(t(cx, "sidebar.savedEmptyHint")))
                 .into_any_element()
-        } else if visible.is_empty() {
+        } else if shown.is_empty() {
             let key = if !self.needle.trim().is_empty() {
                 "sidebar.noMatches"
             } else if self.scope == Scope::Connection {
@@ -409,18 +434,11 @@ impl Render for SavedPanel {
             };
             form::empty_state(None, t(cx, key), cx).into_any_element()
         } else {
-            let rows: Vec<AnyElement> =
-                visible.iter().enumerate().map(|(ix, q)| self.render_row(ix, q, window, cx)).collect();
-            let list = v_flex()
-                .id("saved-list")
-                .debug_selector(|| "saved-list".into())
+            div()
                 .key_context(list_nav::CONTEXT)
                 .track_focus(&self.nav.focus)
-                .track_scroll(&self.nav.scroll)
+                .relative()
                 .size_full()
-                .px(LIST_INSET)
-                .pb(LIST_INSET)
-                .overflow_y_scroll()
                 .on_action(cx.listener(|this, _: &NavUp, _, cx| this.step(-1, cx)))
                 .on_action(cx.listener(|this, _: &NavDown, _, cx| this.step(1, cx)))
                 .on_action(cx.listener(|this, _: &NavFirst, _, cx| this.step(isize::MIN, cx)))
@@ -435,15 +453,56 @@ impl Render for SavedPanel {
                         this.delete(query, window, cx);
                     }
                 }))
-                .children(rows);
-            div()
-                .relative()
-                .size_full()
-                .child(list)
+                .on_action(cx.listener(|this, _: &NavRename, window, cx| {
+                    if let Some(query) = this.nav_query(cx) {
+                        this.rename(query, window, cx);
+                    }
+                }))
+                .child(
+                    uniform_list(
+                        "saved-list",
+                        shown.len(),
+                        cx.processor(move |this, range: Range<usize>, window, cx| {
+                            range.map(|ix| this.render_row(ix, &shown[ix], now_ms, window, cx)).collect::<Vec<_>>()
+                        }),
+                    )
+                    .debug_selector(|| "saved-list".into())
+                    .track_scroll(&self.nav.scroll)
+                    .size_full()
+                    .px(LIST_INSET)
+                    .pb(LIST_INSET),
+                )
                 .child(self.nav.clearance.watch(self.nav.scroll.clone()))
                 .hover_scrollbar(&self.nav.scroll, ScrollbarAxis::Vertical)
                 .into_any_element()
         };
         v_flex().size_full().child(filter_bar).child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use barsql_core::SavedQuery;
+    use jiff::Timestamp;
+
+    use super::row_meta;
+    use crate::saved_queries::SavedSort;
+
+    #[test]
+    fn a_date_sort_shows_how_old_each_query_is() {
+        let now_ms = "2026-10-25T10:00:00Z".parse::<Timestamp>().unwrap().as_millisecond();
+        let query = SavedQuery {
+            created_at: "2026-10-22T10:00:00Z".into(),
+            updated_at: "2026-10-25T09:00:00Z".into(),
+            ..Default::default()
+        };
+        let meta = |sort, connection| row_meta(&query, sort, connection, "en", now_ms);
+        assert_eq!(meta(SavedSort::UpdatedAt, None).as_deref(), Some("1 hour ago"));
+        assert_eq!(meta(SavedSort::CreatedAt, None).as_deref(), Some("3 days ago"));
+        assert_eq!(meta(SavedSort::CreatedAt, Some("Forum")).as_deref(), Some("Forum · 3 days ago"));
+        assert_eq!(meta(SavedSort::Name, Some("Forum")).as_deref(), Some("Forum"));
+        assert_eq!(meta(SavedSort::Name, None), None);
+        let undated = SavedQuery::default();
+        assert_eq!(row_meta(&undated, SavedSort::UpdatedAt, None, "en", now_ms), None, "no date to show");
     }
 }

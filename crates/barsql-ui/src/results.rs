@@ -1,13 +1,14 @@
 use barsql_app::RunEvent;
-use barsql_core::{QueryError, ResultSummary, SqlDialect};
+use barsql_core::{DriverType, QueryError, ResultSummary, SqlDialect};
 use barsql_io::EXPORT_FORMATS;
 use barsql_sql::QueryPlan;
+use barsql_sql::lang::{self, UnknownKind, closest, find_name, unknown_name};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, Selectable, StyledExt, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -18,7 +19,9 @@ use crate::i18n::{I18n, format_number, t, t_count, t_with};
 use crate::list_nav::LIST_INSET;
 use crate::message_log::{self, Heading, Line, MessageLog};
 use crate::plan_view::PlanView;
+use crate::schema::{self, ColumnsLoad};
 use crate::scrollbars::{HoverScrollbar as _, system_bar};
+use crate::shortcuts;
 use crate::toast;
 use crate::tokens::{ICON_SM, ICON_XS, TEXT_MD, TEXT_SM, TEXT_XS};
 
@@ -27,20 +30,33 @@ use crate::tokens::{ICON_SM, ICON_XS, TEXT_MD, TEXT_SM, TEXT_XS};
 pub struct ShownError {
     pub message: SharedString,
     pub info: Option<QueryError>,
+    // Set once a name close to the unknown one turns up.
+    pub fix: Option<Fix>,
     scroll: ScrollHandle,
+}
+
+// A name an error calls unknown, where it stands in its statement, and the one it likely meant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fix {
+    pub statement: String,
+    // In characters into the statement, from 1.
+    pub position: u32,
+    pub name: String,
+    pub meant: String,
 }
 
 impl ShownError {
     pub fn new(error: QueryError, cx: &App) -> Self {
+        let scroll = ScrollHandle::new();
         if error.cancelled {
-            return Self { message: t(cx, "dialog.queryCancelled"), info: None, scroll: ScrollHandle::new() };
+            return Self { message: t(cx, "dialog.queryCancelled"), info: None, fix: None, scroll };
         }
-        Self { message: error.message.clone().into(), info: Some(error), scroll: ScrollHandle::new() }
+        Self { message: error.message.clone().into(), info: Some(error), fix: None, scroll }
     }
 
-    // Centred in the pane. `action` sits next to the copy button.
+    // Centred in the pane. `action` sits next to the copy button, and `fix` next to the hint.
     #[track_caller]
-    pub fn card(&self, action: Option<Button>, cx: &App) -> Div {
+    pub fn card(&self, action: Option<Button>, fix: Option<Button>, cx: &App) -> Div {
         let theme = cx.theme();
         let danger = theme.danger;
         let info = self.info.as_ref();
@@ -57,9 +73,6 @@ impl ShownError {
             .gap(rems(0.615))
             .child(Icon::new(Lucide::CircleAlert).size(ICON_SM).text_color(danger))
             .child(div().min_w_0().truncate().text_size(TEXT_MD).font_semibold().text_color(danger).child(title))
-            .when_some(info.map(|i| i.code.clone()).filter(|code| !code.is_empty()), |el, code| {
-                el.child(form::badge(code, danger).text_size(TEXT_XS).font_family(theme.mono_font_family.clone()))
-            })
             .child(div().flex_1())
             .children(action)
             .child(
@@ -72,6 +85,13 @@ impl ShownError {
                         toast::success(t(cx, "toast.copiedClipboard"), cx);
                     }),
             );
+        let (headline, category) = match info {
+            Some(info) => split_message(&self.message, &info.code),
+            None => (self.message.as_ref(), None),
+        };
+        // Labelled, so a bare `1` doesn't read as a count.
+        let code = info.filter(|i| !i.code.is_empty()).map(|i| t_with(cx, "errors.code", &[("code", &i.code)]));
+        let quiet = [category.map(SharedString::from), code].into_iter().flatten().collect::<Vec<_>>().join(" · ");
         let message = div()
             .id("error-message")
             .max_h(rems(16.))
@@ -79,7 +99,7 @@ impl ShownError {
             .track_scroll(&self.scroll)
             .font_family(theme.mono_font_family.clone())
             .text_color(theme.foreground)
-            .child(self.message.clone());
+            .child(SharedString::from(headline.to_string()));
         let card = form::alert(danger)
             .w_full()
             .max_w(rems(40.))
@@ -88,11 +108,20 @@ impl ShownError {
             .gap(rems(0.462))
             .child(header)
             .child(div().relative().child(message).hover_scrollbar(&self.scroll, ScrollbarAxis::Vertical))
+            .when(!quiet.is_empty(), |el| {
+                el.child(
+                    div()
+                        .debug_selector(|| "error-quiet".into())
+                        .text_size(TEXT_XS)
+                        .text_color(theme.muted_foreground)
+                        .child(quiet),
+                )
+            })
             .when_some(info.filter(|i| !i.detail.is_empty()), |el, info| {
                 el.child(meta("errors.detailLabel", &info.detail, theme.foreground))
             })
             .when_some(info.filter(|i| !i.hint.is_empty()), |el, info| {
-                el.child(meta("errors.hintLabel", &info.hint, theme.primary))
+                el.child(meta("errors.hintLabel", &info.hint, theme.primary).children(fix))
             });
         div().size_full().flex().items_center().justify_center().p(rems(1.846)).child(card)
     }
@@ -111,6 +140,30 @@ impl ShownError {
             }
         }
         lines.join("\n")
+    }
+}
+
+// An error that names an unknown column or table without saying where gets the name's place in the statement, so
+// Jump to error and the squiggle find it, as they do for engines that report one.
+fn locate_unknown(error: &mut QueryError, statement: &str, driver: Option<&DriverType>) {
+    if error.position == 0
+        && let Some((_, name)) = unknown_name(&error.message)
+        && let Some(position) = find_name(statement, &name, driver)
+    {
+        error.position = position;
+    }
+}
+
+// SQLite's messages read "category: message (code)". The message leads, and the category goes under it with the
+// code. Other engines' messages are just the message.
+fn split_message<'a>(message: &'a str, code: &str) -> (&'a str, Option<&'a str>) {
+    let tail = format!(" ({code})");
+    match (!code.is_empty()).then(|| message.strip_suffix(tail.as_str())).flatten() {
+        Some(body) => match body.split_once(": ") {
+            Some((category, rest)) => (rest, Some(category)),
+            None => (body, None),
+        },
+        None => (message, None),
     }
 }
 
@@ -174,15 +227,20 @@ fn ordinals(plans: impl IntoIterator<Item = bool>) -> Vec<usize> {
 pub enum ResultsEvent {
     // `position` counts characters into the statement, starting at 1.
     JumpToError { statement: String, position: u32, message: String },
+    // A run failed at a known place, for the editor to underline.
+    Located { statement: String, position: u32, message: String },
+    // The error card's "Did you mean" button.
+    Fix(Fix),
     // Also sent when there is no focused row anymore.
     FocusedRowChanged,
 }
 
+#[cfg(test)]
 pub enum ResultStatus {
     Empty,
-    Streaming(usize),
-    Rows { count: i64, ms: i64 },
-    Affected { count: i64, ms: i64 },
+    Streaming,
+    Rows { count: i64 },
+    Affected { count: i64 },
     Error(SharedString),
 }
 
@@ -192,6 +250,8 @@ pub struct ResultsPanel {
     active: usize,
     // The tab's connection's, for the grids' SQL copies and exports.
     dialect: Option<SqlDialect>,
+    // The tab's connection, where a name an error calls unknown may have a near one.
+    connection: Option<(String, DriverType)>,
     // The Messages tab is showing, in place of the active result.
     messages_open: bool,
     messages: MessageLog,
@@ -201,6 +261,62 @@ pub struct ResultsPanel {
 impl ResultsPanel {
     pub fn set_dialect(&mut self, dialect: Option<SqlDialect>) {
         self.dialect = dialect;
+    }
+
+    pub fn set_connection(&mut self, id: String, driver: DriverType) {
+        self.connection = Some((id, driver));
+    }
+
+    // A name the error calls unknown may be a typo of one the schema has: a column of the statement's tables, or a
+    // table. Their columns may still be loading, so the hint follows the error by a moment.
+    fn suggest(&self, index: usize, statement: String, error: &QueryError, cx: &mut Context<Self>) {
+        let Some((kind, name)) = unknown_name(&error.message) else { return };
+        let Some((id, _)) = &self.connection else { return };
+        let Some(catalog) = schema::catalog(cx, id) else { return };
+        let (tables, loads): (Vec<String>, Vec<ColumnsLoad>) = match kind {
+            UnknownKind::Table => (catalog.tables.iter().map(|table| table.name.clone()).collect(), Vec::new()),
+            UnknownKind::Column => {
+                let parsed = lang::parse_query(&statement, &catalog);
+                let loads = parsed.bindings.values().map(|b| schema::columns(id, &b.schema, &b.table, cx)).collect();
+                (Vec::new(), loads)
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let mut candidates = tables;
+            for load in loads {
+                if let Ok(columns) = load.await {
+                    candidates.extend(columns.iter().map(|column| column.name.clone()));
+                }
+            }
+            // Only a different name is a suggestion. The same one means the error lies elsewhere.
+            let Some(meant) = closest(&name, candidates.iter().map(String::as_str)).filter(|meant| *meant != name)
+            else {
+                return;
+            };
+            let meant = meant.to_string();
+            let _ = this.update(cx, |this, cx| {
+                let set = this.sets.get_mut(index).filter(|set| set.statement.as_deref() == Some(statement.as_str()));
+                let Some(error) = set.and_then(|set| set.error.as_mut()) else { return };
+                let Some(info) = error.info.as_mut().filter(|info| info.hint.is_empty()) else { return };
+                info.hint = t_with(cx, "errors.didYouMean", &[("name", &meant)]).to_string();
+                let position = info.position;
+                if position > 0 {
+                    error.fix = Some(Fix { statement, position, name, meant });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shown_error(&self) -> Option<QueryError> {
+        self.sets.get(self.active)?.error.as_ref()?.info.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shown_fix(&self) -> Option<Fix> {
+        self.sets.get(self.active)?.error.as_ref()?.fix.clone()
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -304,10 +420,20 @@ impl ResultsPanel {
             }
             RunEvent::Result(result) => {
                 let result = *result;
-                let shown = result.error.map(|error| {
+                let driver = self.connection.as_ref().map(|(_, driver)| driver.clone());
+                let error = result.error.map(|mut error| {
                     failed = (!error.cancelled).then_some(true);
-                    ShownError::new(error, cx)
+                    locate_unknown(&mut error, &result.statement, driver.as_ref());
+                    error
                 });
+                if let Some(error) = &error {
+                    self.suggest(result.result_index, result.statement.clone(), error, cx);
+                    if error.position > 0 {
+                        let (statement, position) = (result.statement.clone(), error.position);
+                        cx.emit(ResultsEvent::Located { statement, position, message: error.message.clone() });
+                    }
+                }
+                let shown = error.map(|error| ShownError::new(error, cx));
                 let plan = result.plan.map(|plan| cx.new(|cx| PlanView::new(plan, cx)));
                 let set = self.slot(result.result_index);
                 set.streaming = false;
@@ -373,6 +499,13 @@ impl ResultsPanel {
             .collect()
     }
 
+    // Rows streamed so far, while the shown result is still streaming.
+    pub fn streamed_rows(&self, cx: &App) -> Option<usize> {
+        let set = self.sets.get(self.active)?;
+        (set.streaming && set.error.is_none() && set.plan.is_none()).then(|| set.rows(cx))
+    }
+
+    #[cfg(test)]
     pub fn status(&self, cx: &App) -> ResultStatus {
         let Some(set) = self.sets.get(self.active) else { return ResultStatus::Empty };
         if let Some(error) = &set.error {
@@ -382,11 +515,10 @@ impl ResultsPanel {
             return ResultStatus::Empty;
         }
         if set.streaming {
-            return ResultStatus::Streaming(set.rows(cx));
+            return ResultStatus::Streaming;
         }
-        let ms = set.summary.as_ref().map_or(0, |s| s.duration_ms);
         let count = set.count(cx).unwrap_or(0);
-        if set.grid.is_some() { ResultStatus::Rows { count, ms } } else { ResultStatus::Affected { count, ms } }
+        if set.grid.is_some() { ResultStatus::Rows { count } } else { ResultStatus::Affected { count } }
     }
 
     #[cfg(test)]
@@ -728,10 +860,32 @@ impl ResultsPanel {
 
     fn empty(&self, set: Option<&ResultSetView>, cx: &App) -> AnyElement {
         let summary = set.and_then(|s| s.summary.as_ref());
+        // Nothing has run yet. Instead of a header saying so, the shortcuts that run something.
+        if summary.is_none() {
+            let hint = |id: &str, key: &str| (shortcuts::shown(id, cx), t(cx, key));
+            return v_flex()
+                .debug_selector(|| "results-empty".into())
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap(rems(0.923))
+                .p(rems(1.231))
+                .text_color(cx.theme().muted_foreground)
+                .child(t(cx, "results.runQueryHint"))
+                .child(form::shortcut_hints(
+                    [
+                        hint("runSelection", "shortcuts.items.runSelection"),
+                        hint("runAll", "shortcuts.items.runAll"),
+                        hint("explainQuery", "shortcuts.items.explainQuery"),
+                    ],
+                    cx,
+                ))
+                .into_any_element();
+        }
         let message = summary.map(|s| s.message.clone()).filter(|m| !m.is_empty());
         let meta = summary.map(|s| {
             let count = if s.affected_rows != 0 { s.affected_rows } else { s.row_count };
-            t_with(cx, "results.metaRowsShort", &[("ms", &s.duration_ms.to_string()), ("count", &count.to_string())])
+            t_count(cx, "results.metaRowsShort", count, &[("ms", &s.duration_ms.to_string())])
         });
         let title = message.clone().map_or_else(|| t(cx, "results.noResults"), SharedString::from);
         let body = message.map_or_else(|| t(cx, "results.runQueryHint"), SharedString::from);
@@ -768,7 +922,15 @@ impl ResultsPanel {
                     cx.emit(ResultsEvent::JumpToError { statement, position, message });
                 }))
         });
-        error.card(jump_button, cx).into_any_element()
+        let fix_button = error.fix.clone().map(|fix| {
+            Button::new("use-meant-name")
+                .debug_selector(|| "use-meant-name".into())
+                .outline()
+                .xsmall()
+                .label(t_with(cx, "errors.useName", &[("name", &fix.meant)]))
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(ResultsEvent::Fix(fix.clone()))))
+        });
+        error.card(jump_button, fix_button, cx).into_any_element()
     }
 
     // For the snapshot hook.
@@ -795,7 +957,7 @@ impl ResultsPanel {
         let rows =
             set.summary.as_ref().filter(|_| !set.streaming).map_or(grid.read(cx).set().rows() as i64, |s| s.row_count);
         let ms = set.summary.as_ref().map_or(0, |s| s.duration_ms);
-        let meta = t_with(cx, "results.metaRows", &[("count", &rows.to_string()), ("ms", &ms.to_string())]);
+        let meta = t_count(cx, "results.metaRows", rows, &[("ms", &ms.to_string())]);
         let toggle = Button::new("chart-toggle")
             .debug_selector(|| "chart-toggle".into())
             .tool(Icon::new(Lucide::ChartColumn), ICON_XS, t(cx, "chart.title"))
@@ -809,7 +971,7 @@ impl ResultsPanel {
         };
         v_flex()
             .size_full()
-            .child(grid::toolbar(grid, meta, Some(toggle), !set.charting, cx))
+            .child(grid::toolbar(grid, meta, None, Some(toggle), !set.charting, cx))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
@@ -856,13 +1018,26 @@ impl Render for ResultsPanel {
 
 #[cfg(test)]
 mod label_tests {
-    use super::ordinals;
+    use super::{ordinals, split_message};
 
     #[test]
     fn grids_and_plans_are_numbered_apart() {
         assert_eq!(ordinals([false, true, false, true]), [1, 1, 2, 2]);
         assert_eq!(ordinals([true, false]), [1, 1]);
         assert!(ordinals([]).is_empty());
+    }
+
+    // SQLite's "category: message (code)" leads with its message. The category goes under it, with the code.
+    #[test]
+    fn an_error_leads_with_what_went_wrong() {
+        let sqlite = "SQL logic error: no such column: usernme (1)";
+        assert_eq!(split_message(sqlite, "1"), ("no such column: usernme", Some("SQL logic error")));
+        let unique = "constraint failed: UNIQUE constraint failed: t.id (2067)";
+        assert_eq!(split_message(unique, "2067"), ("UNIQUE constraint failed: t.id", Some("constraint failed")));
+        let postgres = "column \"usernme\" does not exist";
+        assert_eq!(split_message(postgres, "42703"), (postgres, None), "the code isn't in it");
+        assert_eq!(split_message("no such table (12)", "1"), ("no such table (12)", None), "another number");
+        assert_eq!(split_message("Query cancelled.", ""), ("Query cancelled.", None));
     }
 }
 

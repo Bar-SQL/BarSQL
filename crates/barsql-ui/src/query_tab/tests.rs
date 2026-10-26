@@ -3,7 +3,7 @@ use gpui_kit::component::Theme;
 use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::{Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext, point, px};
 
-use super::{QueryTab, TxnState, char_offset, new_tab_id, results_share, word_range};
+use super::{QueryTab, TxnState, char_offset, dotted_title, misspelt_range, new_tab_id, results_share, word_range};
 use crate::results::ResultStatus;
 use crate::schema;
 use crate::test_support::{Env, settle};
@@ -15,6 +15,25 @@ fn open<'a>(env: &Env, cx: &'a mut TestAppContext, sql: &str) -> (Entity<QueryTa
     let (tab, cx) = cx.add_window_view(|window, cx| QueryTab::new(tab, connection, window, cx));
     cx.update(|window, cx| tab.update(cx, |tab, cx| tab.focus_editor(window, cx)));
     (tab, cx)
+}
+
+// Tabs saved before titles took a middle dot keep their default title, in any language, but not a name of their own.
+#[test]
+fn old_default_titles_take_the_dot() {
+    assert_eq!(dotted_title("Query 1 - Forum", "Forum").as_deref(), Some("Query 1 · Forum"));
+    assert_eq!(dotted_title("Заявка 12 - Forum", "Forum").as_deref(), Some("Заявка 12 · Forum"));
+    assert_eq!(dotted_title("Backup - Forum", "Forum"), None, "a name of its own");
+    assert_eq!(dotted_title("Query 1 - Other", "Forum"), None, "another connection's");
+    assert_eq!(dotted_title("Query 1 · Forum", "Forum"), None);
+}
+
+// Postgres points at the quote that opens a quoted name.
+#[test]
+fn the_misspelt_name_is_found_at_its_position_or_inside_its_quote() {
+    let sql = "SELECT \"usernme\", usernme FROM users";
+    assert_eq!(misspelt_range(sql, 7, "usernme"), Some(8..15));
+    assert_eq!(misspelt_range(sql, 18, "USERNME"), Some(18..25));
+    assert_eq!(misspelt_range(sql, 0, "usernme"), None);
 }
 
 #[test]
@@ -72,8 +91,6 @@ fn run_all_streams_every_result_set(cx: &mut TestAppContext) {
     let (sets, first) = status(&tab, cx);
     assert_eq!(sets, 2);
     assert!(matches!(first, ResultStatus::Rows { count: 3000, .. }), "{:?}", matches!(first, ResultStatus::Empty));
-    let label = cx.update(|_, cx| tab.read(cx).status(cx).text);
-    assert!(label.starts_with("3000 row(s)"), "{label}");
 }
 
 #[gpui_kit::test]
@@ -85,7 +102,53 @@ fn a_failing_statement_shows_its_error(cx: &mut TestAppContext) {
     let (_, status) = status(&tab, cx);
     let ResultStatus::Error(message) = status else { panic!("expected an error") };
     assert!(message.contains("nope"), "{message}");
-    assert!(cx.update(|_, cx| tab.read(cx).status(cx).error));
+}
+
+// SQLite doesn't say where an unknown column is. It's found in the statement anyway, and the name it likely meant is
+// offered from the table's columns.
+#[gpui_kit::test]
+fn a_misspelt_column_is_found_and_the_meant_one_offered(cx: &mut TestAppContext) {
+    let env = Env::new(cx);
+    let (tab, cx) = open(&env, cx, "SELECT id, nmae FROM things");
+    let connection_id = env.connection.id.clone();
+    settle(cx, |cx| cx.update(|_, cx| schema::catalog(cx, &connection_id).is_some()));
+    tab.update_in(cx, |tab, window, cx| tab.run_all(window, cx));
+    settle(cx, idle(&tab));
+    let shown = |cx: &mut VisualTestContext| cx.update(|_, cx| tab.read(cx).results.read(cx).shown_error());
+    settle(cx, |cx| shown(cx).is_some_and(|error| !error.hint.is_empty()));
+    let error = shown(cx).unwrap();
+    assert_eq!(error.position, 12, "where nmae starts");
+    assert_eq!(error.hint, "Did you mean name?");
+}
+
+// A failed run underlines where it failed straight away, and the caret stays where it was.
+#[gpui_kit::test]
+fn a_failed_run_underlines_the_unknown_name_in_place(cx: &mut TestAppContext) {
+    let env = Env::new(cx);
+    let (tab, cx) = open(&env, cx, "SELECT id, nmae FROM things");
+    let caret = |cx: &mut VisualTestContext| cx.update(|_, cx| tab.read(cx).editor.read(cx).cursor());
+    let before = caret(cx);
+    tab.update_in(cx, |tab, window, cx| tab.run_all(window, cx));
+    settle(cx, idle(&tab));
+    let marked = cx.update(|_, cx| tab.read(cx).query_error.as_ref().map(|(range, _)| range.clone()));
+    assert_eq!(marked, Some(11..15), "nmae");
+    assert_eq!(caret(cx), before);
+}
+
+// "Did you mean name?" has a button that puts the name in the SQL, as one edit to undo.
+#[gpui_kit::test]
+fn the_meant_name_replaces_the_misspelt_one(cx: &mut TestAppContext) {
+    let env = Env::new(cx);
+    let (tab, cx) = open(&env, cx, "SELECT id, nmae FROM things");
+    let connection_id = env.connection.id.clone();
+    settle(cx, |cx| cx.update(|_, cx| schema::catalog(cx, &connection_id).is_some()));
+    tab.update_in(cx, |tab, window, cx| tab.run_all(window, cx));
+    settle(cx, idle(&tab));
+    let meant = |cx: &mut VisualTestContext| cx.update(|_, cx| tab.read(cx).results.read(cx).shown_fix());
+    settle(cx, |cx| meant(cx).is_some());
+    let fix = meant(cx).unwrap();
+    tab.update_in(cx, |tab, window, cx| tab.apply_fix(&fix, window, cx));
+    assert_eq!(text(&tab, cx), "SELECT id, name FROM things");
 }
 
 #[gpui_kit::test]
@@ -229,6 +292,38 @@ fn the_results_splitter_drags_between_fifteen_and_seventy_percent(cx: &mut TestA
     assert!((half - 50.).abs() < 1., "{half}");
     assert_eq!(drag(cx, -3., 0.), 70.);
     assert_eq!(drag(cx, 3., height.as_f32()), 15.);
+}
+
+// A double click on the splitter gives the results all the room they may have, and another gives the editor back.
+#[gpui_kit::test]
+fn a_double_click_on_the_splitter_maximizes_the_results_and_restores_them(cx: &mut TestAppContext) {
+    let env = Env::new(cx);
+    let (_tab, cx) = open(&env, cx, "SELECT 1");
+    cx.run_until_parked();
+    let double_click = |cx: &mut VisualTestContext| {
+        let pane = cx.debug_bounds("results-pane").expect("the results are drawn");
+        let at = point(pane.center().x, pane.top());
+        for click_count in [1, 2] {
+            let modifiers = Modifiers::default();
+            cx.simulate_event(gpui_kit::MouseDownEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers,
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui_kit::MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers,
+                click_count,
+            });
+        }
+        cx.run_until_parked();
+        cx.update(|_, cx| results_share(cx))
+    };
+    assert_eq!(double_click(cx), 70.);
+    assert_eq!(double_click(cx), 40., "back to where they were");
 }
 
 #[gpui_kit::test]

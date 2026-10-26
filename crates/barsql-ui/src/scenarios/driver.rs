@@ -15,6 +15,7 @@ use crate::plan_view::PlanView;
 use crate::query_tab::QueryTab;
 use crate::results::{ResultStatus, ResultsPanel, ShownError};
 use crate::sidebar::Sidebar;
+use crate::status_bar::StatusBarState;
 use crate::test_support::{Env, chord, settle};
 use crate::toast::{self, ToastKind};
 use crate::workspace::Workspace;
@@ -322,9 +323,11 @@ impl Driver<'_> {
         self.cx.update(|_, cx| results.read(cx).status(cx))
     }
 
-    pub fn status_is_error(&mut self) -> bool {
-        let tab = self.tab();
-        self.cx.update(|_, cx| tab.read(cx).status(cx).error)
+    // What the status bar shows now.
+    pub fn status_bar(&mut self) -> StatusBarState {
+        self.draw();
+        let workspace = self.workspace.clone();
+        self.cx.update(|window, cx| workspace.read(cx).status(window, cx))
     }
 
     pub fn result_tabs(&mut self) -> usize {
@@ -453,6 +456,17 @@ impl Driver<'_> {
         self.click(selector);
         self.cx.update(|window, cx| window.draw(cx).clear(cx));
         self.keys(&format!("{}enter", "down ".repeat(downs + 1)));
+        self.pause();
+    }
+
+    // As `context_submenu`, for a button's menu.
+    #[cfg(feature = "e2e")]
+    pub fn menu_submenu(&mut self, selector: &'static str, downs: usize, pick: usize) {
+        self.click(selector);
+        self.cx.update(|window, cx| window.draw(cx).clear(cx));
+        self.keys(&"down ".repeat(downs + 1));
+        self.keys("right");
+        self.keys(&format!("{}enter", "down ".repeat(pick)));
         self.pause();
     }
 }

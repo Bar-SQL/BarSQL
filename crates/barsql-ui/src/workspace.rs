@@ -1,8 +1,14 @@
 use std::time::Duration;
 
-use barsql_app::{AppEvent, EditorSession, EditorTab, TableViewRef, Unsaved, is_sqlite_file, sqlite_file_payload};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use barsql_app::{
+    AppEvent, DiagramRef, EditorSession, EditorTab, TableViewRef, Unsaved, is_sqlite_file, sqlite_file_payload,
+};
 use barsql_core::{ConnectionConfig, SavedQuery};
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::scroll::Scrollbar;
@@ -11,25 +17,27 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::actions::*;
+use crate::assets::LOGO;
 use crate::dialogs::{self, Confirm};
+use crate::er_diagram::{self, ErDiagram};
 use crate::grid::RowRef;
 use crate::i18n::{I18n, t, t_count, t_with};
 use crate::json_panel::JsonPanel;
 use crate::query_tab::{QueryTab, QueryTabEvent, TxnState, new_tab_id};
 use crate::quick_search::{self, QuickSearchDialog, TabEntry, Target};
-use crate::schema_tree::TableChange;
+use crate::schema_tree::{ActiveTable, TableChange};
 use crate::scrollbars;
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::state::{self, set_setting, set_setting_bool, set_setting_json, setting_bool};
-use crate::status_bar::{self, StatusBarState};
+use crate::status_bar::{self, StatusAction, StatusActions, StatusBarState, StatusConnection};
 use crate::table_tab::{TableTab, TableTabEvent};
 use crate::theme::ThemeChoice;
 use crate::toast;
 use crate::tokens::{ICON_2XS, ICON_XL, ICON_XS, RADIUS, RADIUS_LG, TEXT_LG, TEXT_MD, TEXT_SM};
 use crate::window_state::{self, WindowState};
 use crate::{
-    LaunchOptions, about_dialog, command_palette, context_menu, grid, schema, screenshots, shortcuts_dialog, theme,
-    tips_dialog, title_bar, update_dialog,
+    LaunchOptions, about_dialog, command_palette, connection_dialog, context_menu, file_dialogs, form, grid, schema,
+    screenshots, shortcuts, shortcuts_dialog, theme, tips_dialog, title_bar, update_dialog,
 };
 
 const SIDEBAR_OPEN_KEY: &str = "barsql-sidebar-open";
@@ -45,13 +53,14 @@ const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 enum TabView {
     Query(Entity<QueryTab>),
     Table(Entity<TableTab>),
+    Diagram(Entity<ErDiagram>),
 }
 
 impl TabView {
     fn query(&self) -> Option<&Entity<QueryTab>> {
         match self {
             Self::Query(tab) => Some(tab),
-            Self::Table(_) => None,
+            Self::Table(_) | Self::Diagram(_) => None,
         }
     }
 
@@ -59,6 +68,15 @@ impl TabView {
         match self {
             Self::Query(tab) => tab.read(cx).id.clone(),
             Self::Table(tab) => tab.read(cx).id.clone(),
+            Self::Diagram(tab) => tab.read(cx).id.clone(),
+        }
+    }
+
+    fn entity_id(&self) -> EntityId {
+        match self {
+            Self::Query(tab) => tab.entity_id(),
+            Self::Table(tab) => tab.entity_id(),
+            Self::Diagram(tab) => tab.entity_id(),
         }
     }
 
@@ -66,6 +84,7 @@ impl TabView {
         match self {
             Self::Query(tab) => tab.read(cx).title.clone(),
             Self::Table(tab) => tab.read(cx).title.clone(),
+            Self::Diagram(tab) => tab.read(cx).title(cx),
         }
     }
 
@@ -73,6 +92,7 @@ impl TabView {
         match self {
             Self::Query(tab) => &tab.read(cx).connection,
             Self::Table(tab) => &tab.read(cx).connection,
+            Self::Diagram(tab) => &tab.read(cx).connection,
         }
     }
 
@@ -80,6 +100,7 @@ impl TabView {
         match self {
             Self::Query(tab) => tab.update(cx, |tab, cx| tab.set_connection(connection, cx)),
             Self::Table(tab) => tab.update(cx, |tab, cx| tab.set_connection(connection, cx)),
+            Self::Diagram(tab) => tab.update(cx, |tab, cx| tab.set_connection(connection, cx)),
         }
     }
 
@@ -87,6 +108,7 @@ impl TabView {
         match self {
             Self::Query(tab) => tab.read(cx).stored(cx),
             Self::Table(tab) => tab.read(cx).stored(cx),
+            Self::Diagram(tab) => tab.read(cx).stored(cx),
         }
     }
 
@@ -98,6 +120,7 @@ impl TabView {
         match self {
             Self::Query(tab) => tab.update(cx, |tab, cx| tab.focus_editor(window, cx)),
             Self::Table(tab) => tab.update(cx, |tab, cx| tab.focus(window, cx)),
+            Self::Diagram(tab) => tab.update(cx, |tab, cx| tab.focus(window, cx)),
         }
     }
 
@@ -105,6 +128,7 @@ impl TabView {
         match self {
             Self::Query(tab) => tab.read(cx).focused_row(cx),
             Self::Table(tab) => tab.read(cx).focused_row(cx),
+            Self::Diagram(_) => None,
         }
     }
 
@@ -120,6 +144,7 @@ impl TabView {
                     Lucide::Table2
                 }
             }
+            Self::Diagram(_) => Lucide::Workflow,
         }
     }
 
@@ -130,6 +155,7 @@ impl TabView {
                 let tab = tab.read(cx);
                 (Some((tab.schema.clone(), tab.table.clone())), String::new())
             }
+            Self::Diagram(_) => (None, String::new()),
         };
         TabEntry {
             id: self.id(cx),
@@ -145,6 +171,7 @@ impl TabView {
         match self {
             Self::Query(tab) => tab.clone().into(),
             Self::Table(tab) => tab.clone().into(),
+            Self::Diagram(tab) => tab.clone().into(),
         }
     }
 }
@@ -154,7 +181,7 @@ type TabAction = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>
 struct OpenTab {
     view: TabView,
     pinned: bool,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: Vec<Subscription>,
 }
 
 #[derive(Clone)]
@@ -192,6 +219,9 @@ pub struct Workspace {
     window_state: Option<WindowState>,
     window_save: Task<()>,
     focus: FocusHandle,
+    // Whether the active tab's grid, not its editor, had the focus last. The status bar keeps speaking for it while
+    // the focus is elsewhere, like in the bar's own popup.
+    grid_context: Cell<Option<(EntityId, bool)>>,
     tabs: Vec<OpenTab>,
     active: usize,
     tab_scroll: ScrollHandle,
@@ -253,9 +283,9 @@ pub fn open(options: LaunchOptions, cx: &mut App) {
                 Some("about") => after = Some(Box::new(about_dialog::open)),
                 Some("er") => {
                     let view = view.clone();
-                    after = Some(Box::new(move |window, cx| {
+                    after = Some(Box::new(move |_, cx| {
                         let tree = view.read(cx).sidebar.read(cx).schema_tree();
-                        tree.update(cx, |tree, cx| tree.open_er_diagram("main".into(), window, cx));
+                        tree.update(cx, |tree, cx| tree.open_er_diagram("main".into(), cx));
                     }));
                 }
                 // Run with BARSQL_SNAPSHOT_RUN, so there's a result to chart.
@@ -315,7 +345,7 @@ pub fn open(options: LaunchOptions, cx: &mut App) {
                         let (query, table) = match view.read(cx).active_tab() {
                             Some(TabView::Query(tab)) => (Some(tab.read(cx).completion()), None),
                             Some(TabView::Table(tab)) => (None, Some(tab.read(cx).completion())),
-                            None => (None, None),
+                            Some(TabView::Diagram(_)) | None => (None, None),
                         };
                         if let Some(completion) = query {
                             completion.update(cx, |completion, cx| completion.preview(&text, window, cx));
@@ -471,6 +501,9 @@ impl Workspace {
                 SidebarEvent::Browse { connection, schema, table } => {
                     this.open_table(connection.clone(), schema.clone(), table.clone(), None, window, cx)
                 }
+                SidebarEvent::OpenDiagram { connection, schema } => {
+                    this.open_diagram(connection.clone(), schema.clone(), window, cx)
+                }
                 SidebarEvent::ConnectionsChanged(connections) => {
                     for open in &this.tabs {
                         let id = open.view.connection(cx).id.clone();
@@ -529,6 +562,7 @@ impl Workspace {
             window_state: None,
             window_save: Task::ready(()),
             focus,
+            grid_context: Cell::new(None),
             tabs: Vec::new(),
             active: 0,
             tab_scroll: ScrollHandle::new(),
@@ -653,6 +687,12 @@ impl Workspace {
         }
     }
 
+    // The panel group keeps its sizes by position, so when the sidebar comes or goes the panels after it would take
+    // each other's. Cleared, each one lays out at its own width again.
+    fn reset_panels(&mut self, cx: &mut Context<Self>) {
+        self.panels.update(cx, |panels, _| panels.clear());
+    }
+
     fn app_event(&mut self, event: AppEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             // Closing and quitting ask first, so only a forced rollback lands here.
@@ -742,9 +782,27 @@ impl Workspace {
 
     fn add_tab(&mut self, tab: EditorTab, connection: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
         let pinned = tab.pinned;
+        if let Some(diagram) = tab.diagram {
+            // A table picked in the diagram opens as a table view beside it, on the connection as it is by then.
+            let (workspace, connection_id, schema) = (cx.weak_entity(), connection.id.clone(), diagram.schema.clone());
+            let on_open: er_diagram::OnOpen = Rc::new(move |table, window, cx| {
+                let _ = workspace.update(cx, |this, cx| {
+                    let Some(connection) = this.sidebar.read(cx).connection(&connection_id).cloned() else { return };
+                    this.open_table(connection, schema.clone(), table, None, window, cx);
+                });
+            });
+            let view = cx.new(|cx| {
+                let mut view = ErDiagram::new(tab.id, connection, diagram.schema, on_open, window, cx);
+                view.load(cx);
+                view
+            });
+            let subscriptions = vec![cx.observe(&view, |_, _, cx| cx.notify())];
+            self.tabs.push(OpenTab { view: TabView::Diagram(view), pinned, _subscriptions: subscriptions });
+            return;
+        }
         if tab.table_view.is_some() {
             let view = cx.new(|cx| TableTab::new(tab, connection, window, cx));
-            let subscriptions = [
+            let subscriptions = vec![
                 cx.observe(&view, |_, _, cx| cx.notify()),
                 cx.subscribe_in(&view, window, |this, view, event: &TableTabEvent, window, cx| match event {
                     TableTabEvent::Edited => this.schedule_save(cx),
@@ -763,7 +821,7 @@ impl Workspace {
             return;
         }
         let view = cx.new(|cx| QueryTab::new(tab, connection, window, cx));
-        let subscriptions = [
+        let subscriptions = vec![
             cx.observe(&view, |_, _, cx| cx.notify()),
             cx.subscribe_in(&view, window, |this, view, event: &QueryTabEvent, window, cx| match event {
                 QueryTabEvent::Edited => this.schedule_save(cx),
@@ -782,6 +840,37 @@ impl Workspace {
         self.tabs.push(OpenTab { view: TabView::Query(view), pinned, _subscriptions: subscriptions });
     }
 
+    // One tab per connection and schema. Opening it again goes back to it.
+    pub(crate) fn open_diagram(
+        &mut self,
+        connection: ConnectionConfig,
+        schema: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.tabs.iter().position(|tab| match &tab.view {
+            TabView::Diagram(view) => {
+                let view = view.read(cx);
+                view.connection.id == connection.id && view.schema == schema
+            }
+            _ => false,
+        });
+        if let Some(ix) = existing {
+            self.activate(ix, window, cx);
+            return;
+        }
+        let tab = EditorTab {
+            id: new_tab_id(),
+            connection_id: connection.id.clone(),
+            title: t_with(cx, "erDiagram.title", &[("schema", &schema)]).to_string(),
+            color: connection.color.clone(),
+            diagram: Some(DiagramRef { schema }),
+            ..Default::default()
+        };
+        self.add_tab(tab, connection, window, cx);
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
     fn open_table(
         &mut self,
         connection: ConnectionConfig,
@@ -796,7 +885,7 @@ impl Workspace {
                 let view = view.read(cx);
                 view.connection.id == connection.id && view.schema == schema && view.table == table
             }
-            TabView::Query(_) => false,
+            TabView::Query(_) | TabView::Diagram(_) => false,
         });
         if let Some(ix) = existing {
             if let (Some(filter), TabView::Table(view)) = (filter, self.tabs[ix].view.clone()) {
@@ -836,7 +925,7 @@ impl Workspace {
                     (shown.connection.id == connection_id && shown.schema == schema && shown.table == table)
                         .then(|| (ix, view.clone()))
                 }
-                TabView::Query(_) => None,
+                TabView::Query(_) | TabView::Diagram(_) => None,
             })
             .collect();
         for (ix, view) in showing.into_iter().rev() {
@@ -848,6 +937,8 @@ impl Workspace {
                 TableChange::Altered => view.update(cx, |view, cx| view.table_changed(None, window, cx)),
             }
         }
+        // A rename keeps its tab, so the mark moves to the new name.
+        self.sync_active_table(cx);
         cx.notify();
     }
 
@@ -1057,10 +1148,27 @@ impl Workspace {
         self.tab_scroll.scroll_to_item(ix);
         let connection_id = view.connection(cx).id.clone();
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_selected(&connection_id, cx));
+        self.sync_active_table(cx);
         view.focus(window, cx);
         self.sync_json_panel(window, cx);
         self.save_session(cx);
         cx.notify();
+    }
+
+    // The tree marks the table the active tab shows, and none for any other tab.
+    fn sync_active_table(&self, cx: &mut Context<Self>) {
+        let table = match self.active_tab() {
+            Some(TabView::Table(tab)) => {
+                let tab = tab.read(cx);
+                Some(ActiveTable {
+                    connection_id: tab.connection.id.clone(),
+                    schema: tab.schema.clone(),
+                    table: tab.table.clone(),
+                })
+            }
+            _ => None,
+        };
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_active_table(table, cx));
     }
 
     fn sync_json_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1106,6 +1214,7 @@ impl Workspace {
         state::spawn(cx, async move { bar.cleanup_tab(&id).await }).detach();
         if self.tabs.is_empty() {
             self.active = 0;
+            self.sync_active_table(cx);
             self.sync_json_panel(window, cx);
             window.focus(&self.focus, cx);
             self.save_session(cx);
@@ -1295,15 +1404,92 @@ impl Workspace {
         window.refresh();
     }
 
-    fn empty_state(&self, cx: &App) -> impl IntoElement {
-        let theme = cx.theme();
+    // With no tab open the main area is the way in. Without connections that's a new one or a SQLite file, which can
+    // be dropped on the window too. With them, a query tab, or the tab closed last.
+    fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let has_connections = self.sidebar.read(cx).has_connections();
+        let button =
+            |id: &'static str, label: SharedString| Button::new(id).debug_selector(move || id.into()).label(label);
+        let actions: Vec<Button> = match has_connections {
+            false => vec![
+                button("welcome-new-connection", t(cx, "sidebar.newConnection"))
+                    .primary()
+                    .icon(IconName::Plus)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.sidebar.update(cx, |sidebar, cx| sidebar.add_connection(window, cx))
+                    })),
+                button("welcome-open-sqlite", t(cx, "app.openSqlite"))
+                    .icon(Icon::new(Lucide::Database))
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_sqlite(window, cx))),
+            ],
+            true => {
+                let mut actions = vec![
+                    button("welcome-new-query", t(cx, "app.newQuery"))
+                        .primary()
+                        .icon(IconName::Plus)
+                        .on_click(cx.listener(|this, _, window, cx| this.welcome_query(window, cx))),
+                ];
+                if !self.closed.is_empty() {
+                    actions.push(
+                        button("welcome-reopen", t(cx, "tabs.reopenClosed"))
+                            .on_click(cx.listener(|this, _, window, cx| this.reopen_closed_tab(window, cx))),
+                    );
+                }
+                actions
+            }
+        };
+        let hint = |id: &str, key: &str| (shortcuts::shown(id, cx), t(cx, key));
+        let mut hints = vec![
+            hint("quickSearch", "shortcuts.items.quickSearch"),
+            hint("commandPalette", "shortcuts.items.commandPalette"),
+        ];
+        if has_connections {
+            hints.push(hint("newTab", "shortcuts.items.newTab"));
+        }
         v_flex()
+            .debug_selector(|| "welcome".into())
             .size_full()
             .items_center()
             .justify_center()
-            .gap_2()
-            .child(div().text_size(TEXT_LG).font_semibold().child(t(cx, "app.emptyTitle")))
-            .child(div().text_color(theme.muted_foreground).child(t(cx, "app.emptyDescription")))
+            .gap(rems(1.538))
+            .p(rems(2.462))
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap(rems(0.308))
+                    .child(img(LOGO).size(rems(4.308)).mb(rems(0.462)))
+                    .child(div().text_size(TEXT_LG).font_semibold().child(t(cx, "app.emptyTitle")))
+                    .child(div().text_color(theme.muted_foreground).child(t(cx, "about.tagline"))),
+            )
+            .child(v_flex().items_center().gap(rems(0.615)).child(h_flex().gap(rems(0.615)).children(actions)).when(
+                !has_connections,
+                |el| {
+                    el.child(
+                        div().text_size(TEXT_SM).text_color(theme.muted_foreground).child(t(cx, "app.welcomeDrop")),
+                    )
+                },
+            ))
+            .child(form::shortcut_hints(hints, cx))
+    }
+
+    // A query tab on the selected connection, or the first one when none is picked yet.
+    fn welcome_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sidebar = self.sidebar.read(cx);
+        if let Some(connection) = sidebar.selected().or_else(|| sidebar.connections().first()).cloned() {
+            self.open_query_tab(connection, window, cx);
+        }
+    }
+
+    // A picked file becomes a prefilled connection, as a dropped one does.
+    fn pick_sqlite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pick = file_dialogs::pick_sqlite_file(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(path) = pick.await else { return };
+            let (file_path, name) = sqlite_file_payload(&path.display().to_string());
+            let _ = this.update_in(cx, |this, window, cx| this.open_sqlite(file_path, name, window, cx));
+        })
+        .detach();
     }
 
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1318,13 +1504,27 @@ impl Workspace {
                 let connection = open.view.connection(cx);
                 let tab_color = match &open.view {
                     TabView::Query(tab) => tab.read(cx).color(),
-                    TabView::Table(_) => &connection.color,
+                    TabView::Table(_) | TabView::Diagram(_) => &connection.color,
                 };
                 let color = parse_color(tab_color).unwrap_or(theme.muted_foreground);
                 let active = ix == self.active;
                 let read_only = connection.read_only;
                 let dirty = open.view.is_dirty(cx);
                 let close_hovered = self.hovered_close == Some(ix);
+                // Unsaved changes show as a dot in the button's place, as in most editors. Under the pointer the
+                // button comes back.
+                let unsaved = dirty && !close_hovered;
+                let dot = || {
+                    let color = if active { theme.foreground } else { theme.muted_foreground };
+                    div()
+                        .debug_selector(move || format!("unsaved-tab-{ix}"))
+                        .size(ICON_2XS)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().size(rems(0.462)).rounded_full().bg(color))
+                        .into_any_element()
+                };
                 h_flex()
                     .id(("editor-tab", ix))
                     .debug_selector(move || format!("editor-tab-{ix}"))
@@ -1356,13 +1556,7 @@ impl Workspace {
                         let lock = if active { theme.foreground.opacity(0.7) } else { theme.muted_foreground };
                         el.child(Icon::new(Lucide::Lock).size(ICON_2XS).text_color(lock))
                     })
-                    .child(
-                        div()
-                            .max_w(rems(15.385))
-                            .truncate()
-                            .when(dirty, |el| el.text_color(theme.warning))
-                            .child(open.view.title(cx)),
-                    )
+                    .child(div().max_w(rems(15.385)).truncate().child(open.view.title(cx)))
                     .child(
                         match open.pinned {
                             // A pinned tab shows its pin, which unpins it, in place of the close button.
@@ -1372,8 +1566,11 @@ impl Workspace {
                                 .flex_none()
                                 .ml(rems(0.308))
                                 .px(rems(0.154))
-                                .opacity(if close_hovered { 1. } else { 0.7 })
-                                .child(Icon::new(Lucide::Pin).size(ICON_2XS))
+                                .opacity(if close_hovered || unsaved { 1. } else { 0.7 })
+                                .child(match unsaved {
+                                    true => dot(),
+                                    false => Icon::new(Lucide::Pin).size(ICON_2XS).into_any_element(),
+                                })
                                 .on_click(cx.listener({
                                     let id = id.clone();
                                     move |this, _, window, cx| {
@@ -1387,12 +1584,14 @@ impl Workspace {
                                 .flex_none()
                                 .ml(rems(0.308))
                                 .px(rems(0.154))
-                                .opacity(if close_hovered { 1. } else { 0.5 })
-                                .child(
-                                    Icon::new(IconName::Close)
+                                .opacity(if close_hovered || unsaved { 1. } else { 0.5 })
+                                .child(match unsaved {
+                                    true => dot(),
+                                    false => Icon::new(IconName::Close)
                                         .size(ICON_2XS)
-                                        .when(close_hovered, |icon| icon.text_color(theme.danger)),
-                                )
+                                        .when(close_hovered, |icon| icon.text_color(theme.danger))
+                                        .into_any_element(),
+                                })
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.hovered_close = None;
@@ -1572,27 +1771,21 @@ impl Workspace {
         }
     }
 
-    fn status(&self, cx: &App) -> StatusBarState {
+    pub(crate) fn status(&self, window: &Window, cx: &App) -> StatusBarState {
+        let named = |connection: &ConnectionConfig| StatusConnection {
+            name: connection.name.clone().into(),
+            engine: connection_dialog::engine_name(&connection.driver, cx),
+            connected: state::bar(cx).is_connected(&connection.id),
+        };
         let Some(tab) = self.active_tab() else {
-            return StatusBarState {
-                connection: None,
-                read_only: false,
-                protected: false,
-                transaction: None,
-                caret: None,
-                aggregate: None,
-                status: t(cx, "app.statusReady"),
-                error: false,
-            };
+            let connection = self.sidebar.read(cx).selected().map(named);
+            return StatusBarState { connection, ..Default::default() };
         };
         let connection = tab.connection(cx);
-        let connected = state::bar(cx).is_connected(&connection.id);
-        let (status, error) = match tab {
-            TabView::Query(tab) => {
-                let status = tab.read(cx).status(cx);
-                (status.text, status.error)
-            }
-            TabView::Table(tab) => tab.read(cx).status(cx),
+        let live = match tab {
+            TabView::Query(tab) => tab.read(cx).live_status(cx),
+            TabView::Table(tab) => tab.read(cx).is_loading().then(|| t(cx, "tableView.loading")),
+            TabView::Diagram(_) => None,
         };
         let query = tab.query().map(|tab| tab.read(cx));
         let transaction = query.and_then(|tab| match tab.txn_state() {
@@ -1600,15 +1793,69 @@ impl Workspace {
             TxnState::Active => Some(false),
             TxnState::Error => Some(true),
         });
+        let grid = self.active_grid(cx);
+        let in_grid = grid.as_ref().is_some_and(|grid| grid.read(cx).focus_handle(cx).contains_focused(window, cx));
+        let in_editor = query.is_some_and(|tab| tab.editor_has_focus(window, cx));
+        let last = self.grid_context.get().filter(|(id, _)| *id == tab.entity_id()).map(|(_, grid)| grid);
+        let grid_context = in_grid || (!in_editor && last.unwrap_or(query.is_none()));
+        self.grid_context.set(Some((tab.entity_id(), grid_context)));
+        let grid = grid.filter(|_| grid_context);
         StatusBarState {
-            connection: Some((format!("{} ({})", connection.name, connection.driver).into(), connected)),
+            connection: Some(named(connection)),
+            color: parse_color(&connection.color),
             read_only: connection.read_only,
             protected: connection.confirm_changes,
             transaction,
-            caret: query.map(|tab| tab.caret(cx)),
-            aggregate: self.active_grid(cx).and_then(|grid| grid.read(cx).aggregate()),
-            status,
-            error,
+            caret: query.filter(|_| grid.is_none()).map(|tab| tab.caret(cx)),
+            aggregate: grid.and_then(|grid| grid.read(cx).aggregate()),
+            live,
+            actions: StatusActions::default(),
+        }
+    }
+
+    // A click on the caret's place goes to a line, on the connection opens the switcher, on its chips opens its
+    // settings, and on Stop ends the run.
+    fn status_actions(&self, cx: &Context<Self>) -> StatusActions {
+        let this = cx.weak_entity();
+        let on = |f: fn(&mut Self, &mut Window, &mut Context<Self>)| -> StatusAction {
+            let this = this.clone();
+            Rc::new(move |window, cx| {
+                let _ = this.update(cx, |this, cx| f(this, window, cx));
+            })
+        };
+        let query = self.active_tab().and_then(TabView::query);
+        StatusActions {
+            go_to_line: query.map(|_| on(Self::go_to_line)),
+            switch_connection: Some(on(Self::open_switcher)),
+            edit_connection: self.active_tab().map(|_| on(Self::edit_tab_connection)),
+            stop: query.filter(|tab| tab.read(cx).is_running()).map(|_| on(Self::stop_run)),
+        }
+    }
+
+    fn go_to_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab().and_then(TabView::query).cloned() {
+            tab.update(cx, |tab, cx| tab.go_to_line(window, cx));
+        }
+    }
+
+    fn open_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sidebar_open {
+            self.sidebar_open = true;
+            set_setting_bool(cx, SIDEBAR_OPEN_KEY, true);
+            self.reset_panels(cx);
+        }
+        self.sidebar.update(cx, |sidebar, cx| sidebar.open_switcher(window, cx));
+        cx.notify();
+    }
+
+    fn edit_tab_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connection) = self.active_tab().map(|tab| tab.connection(cx).clone()) else { return };
+        self.sidebar.update(cx, |sidebar, cx| sidebar.edit_connection(Some(connection), window, cx));
+    }
+
+    fn stop_run(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab().and_then(TabView::query).cloned() {
+            tab.update(cx, |tab, cx| tab.cancel(cx));
         }
     }
 
@@ -1616,6 +1863,7 @@ impl Workspace {
         match self.active_tab()? {
             TabView::Query(tab) => tab.read(cx).results().read(cx).active_grid(),
             TabView::Table(tab) => Some(tab.read(cx).grid()),
+            TabView::Diagram(_) => None,
         }
     }
 }
@@ -1777,6 +2025,7 @@ impl Render for Workspace {
                 this.sidebar_open = !this.sidebar_open;
                 set_setting_bool(cx, SIDEBAR_OPEN_KEY, this.sidebar_open);
                 set_menus(cx);
+                this.reset_panels(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| window.minimize_window()))
@@ -1856,9 +2105,9 @@ impl Render for Workspace {
                         .when(self.sidebar_open, |panels| {
                             panels.child(
                                 resizable_panel()
-                                    .flex_none()
                                     .size(self.sidebar_width)
                                     .size_range(px(SIDEBAR_WIDTHS.1)..px(SIDEBAR_WIDTHS.2))
+                                    .fixed()
                                     .child(self.sidebar.clone()),
                             )
                         })
@@ -1866,15 +2115,18 @@ impl Render for Workspace {
                         .when(self.json_open, |panels| {
                             panels.child(
                                 resizable_panel()
-                                    .flex_none()
                                     .size(self.json_width)
                                     .size_range(px(JSON_WIDTHS.1)..px(JSON_WIDTHS.2))
+                                    .fixed()
                                     .child(self.json_panel.clone()),
                             )
                         }),
                 ),
             )
-            .child(status_bar::render(self.status(cx), cx))
+            .child(status_bar::render(
+                StatusBarState { actions: self.status_actions(cx), ..self.status(window, cx) },
+                cx,
+            ))
             .children(toast::render(window, cx))
             .child(self.drop_overlay(cx))
             .child(self.context_menu.clone())

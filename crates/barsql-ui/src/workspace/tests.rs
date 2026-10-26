@@ -1,18 +1,20 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use barsql_app::{EditorSession, EditorTab, TableViewRef};
+use barsql_app::{DiagramRef, EditorSession, EditorTab, TableViewRef};
 use barsql_core::SavedQuery;
 use gpui_kit::component::{Root, WindowExt};
 use gpui_kit::{
-    AppContext as _, Entity, ExternalPaths, FileDropEvent, Modifiers, MouseButton, TestAppContext, VisualTestContext,
-    point, px, size,
+    AppContext as _, Entity, ExternalPaths, FileDropEvent, Modifiers, MouseButton, Pixels, TestAppContext,
+    VisualTestContext, point, px, size,
 };
 
 use super::Workspace;
+use crate::actions::{ToggleJsonPanel, ToggleSidebar};
 use crate::query_tab::QueryTab;
 use crate::saved_queries;
-use crate::test_support::Env;
+use crate::schema_tree::TableChange;
+use crate::test_support::{Env, settle};
 use crate::window_state;
 
 fn tab(id: &str, connection_id: &str, sql: &str) -> EditorTab {
@@ -50,6 +52,48 @@ fn end_of_text() -> &'static str {
 
 fn ids(session: &EditorSession) -> Vec<&str> {
     session.tabs.iter().map(|t| t.id.as_str()).collect()
+}
+
+// The ER diagram is a tab: the session brings it back, and opening it again goes to that tab.
+#[gpui_kit::test]
+fn the_er_diagram_is_a_tab_that_the_session_keeps(cx: &mut TestAppContext) {
+    let env = Env::new(cx);
+    let id = env.connection.id.clone();
+    let diagram = EditorTab {
+        id: "er".into(),
+        connection_id: id.clone(),
+        title: "ER diagram · main".into(),
+        diagram: Some(DiagramRef { schema: "main".into() }),
+        ..Default::default()
+    };
+    let session = EditorSession { tabs: vec![tab("a", &id, "SELECT 1"), diagram], active_tab: "er".into() };
+    env.bar.save_editor_session(session).unwrap();
+    let (workspace, cx) = open(cx);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("er-diagram").is_some(), "the restored diagram is drawn");
+    let connection = env.connection.clone();
+    workspace.update_in(cx, |ws, window, cx| {
+        ws.activate(0, window, cx);
+        ws.open_diagram(connection, "main".into(), window, cx);
+    });
+    let (count, active) = cx.update(|_, cx| (workspace.read(cx).tabs.len(), workspace.read(cx).active));
+    assert_eq!((count, active), (2, 1), "opening it again goes back to its tab");
+    workspace.update(cx, |ws, cx| ws.save_session(cx));
+    let saved = env.bar.editor_session();
+    assert_eq!(saved.tabs[1].diagram.as_ref().map(|d| d.schema.as_str()), Some("main"));
+}
+
+// With no tab open, the main area is the way in: with a connection there, that's a query tab on it.
+#[gpui_kit::test]
+fn the_welcome_screen_opens_a_query_tab(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (workspace, cx) = open(cx);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| workspace.read(cx).tabs.len()), 0);
+    let button = cx.debug_bounds("welcome-new-query").expect("the welcome screen offers a new query");
+    cx.simulate_click(button.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| workspace.read(cx).tabs.len()), 1);
 }
 
 #[gpui_kit::test]
@@ -95,6 +139,56 @@ fn a_session_that_opens_on_a_table_view_fills_the_sidebar_tree(cx: &mut TestAppC
     crate::test_support::settle(cx, |cx| {
         cx.update(|_, cx| tree.read(cx).listed().iter().any(|(row, _, _)| row == "s:main"))
     });
+}
+
+// A session with a query tab and a table tab on `things`, which is active, once the tree lists that table.
+fn open_on_things<'a>(env: &Env, cx: &'a mut TestAppContext) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+    let id = env.connection.id.clone();
+    let table_view = EditorTab {
+        table_view: Some(TableViewRef { schema: "main".into(), table: "things".into(), ..Default::default() }),
+        ..tab("view", &id, "")
+    };
+    let session = EditorSession { tabs: vec![tab("query", &id, "SELECT 1"), table_view], active_tab: "view".into() };
+    env.bar.save_editor_session(session).unwrap();
+    let (workspace, cx) = open(cx);
+    wait_for_row(&workspace, "t:main.things", cx);
+    (workspace, cx)
+}
+
+fn wait_for_row(workspace: &Entity<Workspace>, row: &str, cx: &mut VisualTestContext) {
+    let tree = cx.update(|_, cx| workspace.read(cx).sidebar().read(cx).panels().0);
+    settle(cx, |cx| cx.update(|_, cx| tree.read(cx).listed().iter().any(|(id, _, _)| id == row)));
+}
+
+// Whether the tree's row with this selector carries the active tab's mark.
+fn marks(row: &'static str, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx.debug_bounds(row).expect("the table's row is drawn");
+    cx.debug_bounds("open-table").is_some_and(|mark| row.contains(&mark.center()))
+}
+
+// The tree marks the table the active tab shows, and no table while a query tab is active.
+#[gpui_kit::test]
+fn the_tree_marks_the_table_open_in_the_active_tab(cx: &mut TestAppContext) {
+    let env = Env::new(cx);
+    let (workspace, cx) = open_on_things(&env, cx);
+    assert!(marks("tree:t:main.things", cx), "the table tab's table is marked");
+    workspace.update_in(cx, |ws, window, cx| ws.activate(0, window, cx));
+    assert!(!marks("tree:t:main.things", cx), "a query tab marks no table");
+}
+
+// A renamed table keeps its tab, and the mark goes with it to the new name.
+#[gpui_kit::test]
+fn the_mark_follows_a_renamed_table(cx: &mut TestAppContext) {
+    let env = Env::new(cx);
+    let id = env.connection.id.clone();
+    let (workspace, cx) = open_on_things(&env, cx);
+    env.runtime.block_on(env.bar.execute_query(&id, "ALTER TABLE things RENAME TO stuff")).unwrap();
+    let renamed = TableChange::Renamed("stuff".into());
+    workspace.update_in(cx, |ws, window, cx| ws.table_changed(&id, "main", "things", &renamed, window, cx));
+    cx.update(|_, cx| crate::schema::reload_tables(&id, "main", cx));
+    wait_for_row(&workspace, "t:main.stuff", cx);
+    assert!(marks("tree:t:main.stuff", cx));
 }
 
 #[gpui_kit::test]
@@ -146,8 +240,12 @@ fn saved_queries_open_linked_tabs_that_track_changes(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(end_of_text());
     cx.simulate_input(" + 1");
     assert!(cx.update(|_, cx| tab.read(cx).is_dirty(cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("unsaved-tab-0").is_some(), "an unsaved tab shows a dot");
     cx.simulate_keystrokes(&format!("{}-s", modifier()));
     assert!(!cx.update(|_, cx| tab.read(cx).is_dirty(cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("unsaved-tab-0").is_none(), "saving clears it");
     assert_eq!(env.bar.list_saved_queries("")[0].sql, "SELECT 1 + 1");
     assert_eq!(cx.update(|_, cx| saved_queries::list(cx)[0].sql.clone()), "SELECT 1 + 1");
 
@@ -200,6 +298,58 @@ fn panel_widths_come_back_clamped_and_drags_store_them(cx: &mut TestAppContext) 
     let settings = env.bar.settings();
     assert_eq!(settings.get("barsql-sidebar-w").map(String::as_str), Some("301"));
     assert_eq!(settings.get("barsql-json-w").map(String::as_str), Some("251"));
+}
+
+// The sidebar's and the JSON panel's widths, for those that are open, once the panels have settled.
+fn panel_widths(cx: &mut VisualTestContext) -> (Option<Pixels>, Option<Pixels>) {
+    // A resize or a toggle settles on the frame after.
+    for _ in 0..2 {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let sidebar = cx.debug_bounds("sidebar").map(|bounds| bounds.size.width);
+    let json = cx.debug_bounds("json-panel-header").map(|bounds| bounds.size.width);
+    (sidebar, json)
+}
+
+// The side panels keep their widths while the window resizes. The editor between them takes the difference.
+#[gpui_kit::test]
+fn the_side_panels_keep_their_widths_when_the_window_resizes(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (workspace, cx) = open(cx);
+    workspace.update_in(cx, |workspace, window, cx| workspace.toggle_json_panel(window, cx));
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    let given = panel_widths(cx);
+    assert_eq!(given.0, Some(px(280.)));
+    assert!(given.1.is_some(), "the JSON panel is open");
+    for width in [1800., 1000.] {
+        cx.simulate_resize(size(px(width), px(800.)));
+        assert_eq!(panel_widths(cx), given, "at {width}px");
+    }
+}
+
+// Closing the sidebar leaves the JSON panel as wide as it was, and opening it again, by its toggle or the connection
+// switcher, brings back both widths.
+#[gpui_kit::test]
+fn the_json_panel_keeps_its_width_while_the_sidebar_closes_and_opens(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (workspace, cx) = open(cx);
+    cx.simulate_resize(size(px(1400.), px(800.)));
+    workspace.update_in(cx, |_, window, cx| window.dispatch_action(Box::new(ToggleJsonPanel), cx));
+    let (sidebar, json) = panel_widths(cx);
+    assert_eq!(sidebar, Some(px(280.)));
+    assert!(json.is_some(), "the JSON panel is open");
+
+    workspace.update_in(cx, |_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+    assert_eq!(panel_widths(cx), (None, json), "with the sidebar closed");
+    workspace.update_in(cx, |_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+    assert_eq!(panel_widths(cx), (sidebar, json), "with the sidebar open again");
+
+    // The status bar's connection chip opens the sidebar on its switcher.
+    workspace.update_in(cx, |_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+    assert_eq!(panel_widths(cx), (None, json), "with the sidebar closed again");
+    workspace.update_in(cx, |workspace, window, cx| workspace.open_switcher(window, cx));
+    assert_eq!(panel_widths(cx), (sidebar, json), "with the switcher opening the sidebar");
 }
 
 #[gpui_kit::test]
@@ -267,10 +417,10 @@ fn the_menus_tick_what_is_on(cx: &mut TestAppContext) {
     let (workspace, cx) = open(cx);
     let menus = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.get_menus().unwrap_or_default());
     let current = menus(cx);
-    assert_eq!(checked(&current, "Dark theme"), Some(true));
+    assert_eq!(checked(&current, "Dark"), Some(true));
     assert_eq!(checked(&current, "English"), Some(true));
-    assert_eq!(checked(&current, "Toggle sidebar"), Some(true));
-    assert_eq!(checked(&current, "Toggle JSON viewer"), Some(false));
+    assert_eq!(checked(&current, "Sidebar"), Some(true));
+    assert_eq!(checked(&current, "JSON viewer"), Some(false));
 
     // Windows and Linux draw these in the title bar from GPUI Kit's copy.
     let drawn = |cx: &mut VisualTestContext| {
@@ -283,8 +433,8 @@ fn the_menus_tick_what_is_on(cx: &mut TestAppContext) {
 
     workspace.update_in(cx, |_, window, cx| window.dispatch_action(Box::new(crate::actions::ToggleSidebar), cx));
     cx.run_until_parked();
-    assert_eq!(checked(&menus(cx), "Toggle sidebar"), Some(false));
-    assert_eq!(checked(&drawn(cx), "Toggle sidebar"), Some(false));
+    assert_eq!(checked(&menus(cx), "Sidebar"), Some(false));
+    assert_eq!(checked(&drawn(cx), "Sidebar"), Some(false));
     if cfg!(target_os = "macos") {
         assert!(menus(cx).iter().any(|menu| menu.name.as_ref() == "Window"), "AppKit's Window menu");
     }
@@ -326,7 +476,7 @@ fn a_closed_table_view_reopens_with_its_filter_and_sort(cx: &mut TestAppContext)
     });
     let table = cx.update(|_, cx| match &workspace.read(cx).tabs.last().unwrap().view {
         super::TabView::Table(table) => table.clone(),
-        super::TabView::Query(_) => panic!("a table view"),
+        _ => panic!("a table view"),
     });
     crate::test_support::settle(cx, |cx| cx.update(|_, cx| table.read(cx).is_loaded()));
     table.update_in(cx, |table, window, cx| table.sort_by(1, window, cx));

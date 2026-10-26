@@ -2,21 +2,22 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::time::Duration;
 
-use barsql_core::{ColumnInfo, ConnectionConfig, DriverType, ObjectKind, ObjectRef, TableInfo};
+use barsql_core::{ColumnInfo, ConnectionConfig, DriverType, ObjectKind, ObjectRef, SqlDialect, TableInfo};
 use barsql_sql::alter::ConstraintKind;
 use barsql_sql::dml::preview_select;
 use barsql_sql::lang::quoting::build_qualified_table;
 use barsql_sql::system_views::{ViewScope, views};
+use barsql_sql::{TypeFamily, display_type, type_family};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollbarAxis;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::form;
 use crate::i18n::{I18n, count, t, t_count, t_with};
 use crate::list_nav::{self, BarClearance, LIST_INSET};
 use crate::schema::{self, Schemas};
@@ -29,6 +30,7 @@ use crate::spinner::Spinner;
 use crate::state::{self, set_setting_json, setting_json};
 use crate::toast;
 use crate::tokens::{ICON_SM, ICON_XS, RADIUS, RADIUS_SM, TEXT_2XS, TEXT_BASE, TEXT_SM, TEXT_XS, TINT};
+use crate::{form, hover_card};
 
 // How far a table's Browse button sits from the end of its row.
 const BROWSE_INSET: Rems = rems(0.308);
@@ -37,9 +39,13 @@ const TABLES_EXPANDED_KEY: &str = "barsql-schema-tables-expanded";
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 const ROW_HEIGHT_REM: f32 = 2.;
 const INDENT_REM: f32 = 1.231;
+// A row's own inset, before its chevron.
+const ROW_PADDING: Rems = rems(0.462);
+// Enum values a column's tooltip lists before cutting off.
+const TIP_VALUES: usize = 12;
 const CONTEXT: &str = "SchemaTree";
 
-actions!(schema_tree, [CursorUp, CursorDown, CursorFirst, CursorLast, ActivateRow]);
+actions!(schema_tree, [CursorUp, CursorDown, CursorFirst, CursorLast, ActivateRow, CollapseRow, ExpandRow]);
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
@@ -50,6 +56,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("end", CursorLast, context),
         KeyBinding::new("enter", ActivateRow, context),
         KeyBinding::new("space", ActivateRow, context),
+        KeyBinding::new("left", CollapseRow, context),
+        KeyBinding::new("right", ExpandRow, context),
     ]);
 }
 
@@ -59,12 +67,22 @@ pub enum SchemaTreeEvent {
     // `run` runs it as soon as its tab opens, as the system views do.
     OpenQuery { sql: String, title: String, run: bool },
     Browse { schema: String, table: String },
+    // The ER diagram of a schema, in its own tab.
+    OpenDiagram { schema: String },
     // SQL for another connection, like a schema comparison's sync script. Opens without running.
     OpenScript { connection: Box<ConnectionConfig>, sql: String, title: String },
     // Connect button succeeded for this connection id, so land in a tab for it.
     Connected(String),
     // A dialog changed a table, so its open table views need to follow.
     TableChanged { connection_id: String, schema: String, table: String, change: TableChange },
+}
+
+// The table the active tab shows. Its row is marked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveTable {
+    pub connection_id: String,
+    pub schema: String,
+    pub table: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,12 +93,15 @@ pub enum TableChange {
     Altered,
 }
 
-pub fn column_matches(column: &ColumnInfo, needle: &str) -> bool {
-    format!("{} {}", column.name, column.data_type).to_lowercase().contains(needle)
+// The type as shown and as the catalog spells it, so `varchar` and `character varying` both find a column.
+pub fn column_matches(driver: &DriverType, column: &ColumnInfo, needle: &str) -> bool {
+    let shown = display_type(driver.dialect(), &column.data_type);
+    format!("{} {} {shown}", column.name, column.data_type).to_lowercase().contains(needle)
 }
 
-pub fn table_matches(name: &str, columns: Option<&[ColumnInfo]>, needle: &str) -> bool {
-    name.to_lowercase().contains(needle) || columns.is_some_and(|cols| cols.iter().any(|c| column_matches(c, needle)))
+pub fn table_matches(driver: &DriverType, name: &str, columns: Option<&[ColumnInfo]>, needle: &str) -> bool {
+    name.to_lowercase().contains(needle)
+        || columns.is_some_and(|cols| cols.iter().any(|c| column_matches(driver, c, needle)))
 }
 
 enum GroupState {
@@ -90,11 +111,12 @@ enum GroupState {
 
 #[derive(Clone)]
 enum RowKind {
-    Schema { name: String, expanded: bool, count: Option<String> },
-    Table { schema: String, table: TableInfo, expanded: bool },
-    Column { column: ColumnInfo, matched: bool, schema: String, table: String, view: bool },
+    // `kept_open`: a search holds the row open.
+    Schema { name: String, expanded: bool, kept_open: bool, count: Option<String> },
+    Table { schema: String, table: TableInfo, expanded: bool, kept_open: bool },
+    Column { column: ColumnInfo, schema: String, table: String, view: bool },
     Group { key: String, group: Group, schema: String, table: Option<String>, expanded: bool, count: Option<usize> },
-    Object { row: ObjectRow, group: Group, schema: String, table: Option<String> },
+    Object { row: ObjectRow, schema: String, table: Option<String> },
     Note { text: SharedString, spinner: bool },
 }
 
@@ -126,6 +148,7 @@ pub struct SchemaTree {
     // Kept by row id so it survives rows opening and closing around it. The ring shows only after a key moves it.
     cursor: Option<SharedString>,
     keyed: bool,
+    active_table: Option<ActiveTable>,
     search_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -170,6 +193,7 @@ impl SchemaTree {
             focus: cx.focus_handle(),
             cursor: None,
             keyed: false,
+            active_table: None,
             search_task: Task::ready(()),
             _subscriptions: subscriptions,
         }
@@ -182,13 +206,19 @@ impl SchemaTree {
             self.error = None;
             self.connecting = false;
         }
-        // A connection that is up loads its schema on first view, also when it came up after the tree showed it,
-        // as when the connection switcher connects it.
+        // A live connection loads its schema on first view, even if it connected after the tree showed it.
         if let Some(conn) = self.connection.clone().filter(|c| state::bar(cx).is_connected(&c.id)) {
             self.load(&conn, false, cx);
         }
         if !same {
             self.schema_changed(cx);
+        }
+    }
+
+    pub fn set_active_table(&mut self, table: Option<ActiveTable>, cx: &mut Context<Self>) {
+        if self.active_table != table {
+            self.active_table = table;
+            cx.notify();
         }
     }
 
@@ -454,21 +484,22 @@ impl SchemaTree {
                 .iter()
                 .filter(|t| {
                     let schema_name = if t.schema.is_empty() { &sch.name } else { &t.schema };
-                    needle.is_empty()
-                        || table_matches(&t.name, data.columns(schema_name, &t.name).map(|c| c.as_slice()), needle)
+                    let columns = data.columns(schema_name, &t.name).map(|c| c.as_slice());
+                    needle.is_empty() || table_matches(&conn.driver, &t.name, columns, needle)
                 })
                 .collect();
             if !needle.is_empty() && visible.is_empty() && !loading {
                 continue;
             }
-            let expanded = !needle.is_empty() || self.expanded_schemas.get(&key) == Some(&true);
+            let kept_open = !needle.is_empty();
+            let expanded = kept_open || self.expanded_schemas.get(&key) == Some(&true);
             let count = (!all.is_empty()).then(|| {
                 if needle.is_empty() { all.len().to_string() } else { format!("{}/{}", visible.len(), all.len()) }
             });
             rows.push(TreeRow {
                 id: format!("s:{}", sch.name).into(),
                 depth: 0,
-                kind: RowKind::Schema { name: sch.name.clone(), expanded, count },
+                kind: RowKind::Schema { name: sch.name.clone(), expanded, kept_open, count },
             });
             if !expanded {
                 continue;
@@ -504,22 +535,23 @@ impl SchemaTree {
         let loading = data.is_some_and(|d| d.columns_loading(schema_name, &table.name));
         let needle = self.needle.as_str();
         let name_matches = needle.is_empty() || table.name.to_lowercase().contains(needle);
-        let column_hit = !needle.is_empty() && columns.is_some_and(|c| c.iter().any(|col| column_matches(col, needle)));
+        let matches = |column: &ColumnInfo| column_matches(&conn.driver, column, needle);
+        let column_hit = !needle.is_empty() && columns.is_some_and(|c| c.iter().any(matches));
         let tk = format!("{}:{schema_name}:{}", conn.id, table.name);
-        let expanded = self.expanded_tables.get(&tk) == Some(&true)
-            || (!needle.is_empty() && !name_matches && (column_hit || loading));
+        let kept_open = !needle.is_empty() && !name_matches && (column_hit || loading);
+        let expanded = kept_open || self.expanded_tables.get(&tk) == Some(&true);
         let id = format!("{schema_name}.{}", table.name);
         rows.push(TreeRow {
             id: format!("t:{id}").into(),
             depth: 1,
-            kind: RowKind::Table { schema: schema_name.to_string(), table: table.clone(), expanded },
+            kind: RowKind::Table { schema: schema_name.to_string(), table: table.clone(), expanded, kept_open },
         });
         if !expanded {
             return;
         }
         let shown: Vec<&ColumnInfo> = match columns {
             Some(cols) if name_matches => cols.iter().collect(),
-            Some(cols) => cols.iter().filter(|c| column_matches(c, needle)).collect(),
+            Some(cols) => cols.iter().filter(|c| matches(c)).collect(),
             None => Vec::new(),
         };
         if loading {
@@ -536,7 +568,6 @@ impl SchemaTree {
                     depth: 2,
                     kind: RowKind::Column {
                         column: column.clone(),
-                        matched: !needle.is_empty() && column_matches(column, needle),
                         schema: schema_name.to_string(),
                         table: table.name.clone(),
                         view,
@@ -595,7 +626,6 @@ impl SchemaTree {
                 depth: depth + 1,
                 kind: RowKind::Object {
                     row: row.clone(),
-                    group,
                     schema: schema_name.to_string(),
                     table: table.map(str::to_string),
                 },
@@ -800,8 +830,8 @@ impl SchemaTree {
             };
             let diagram = {
                 let (this, name) = (this.clone(), name.clone());
-                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                    let _ = this.update(cx, |tree, cx| tree.open_er_diagram(name.clone(), window, cx));
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = this.update(cx, |tree, cx| tree.open_er_diagram(name.clone(), cx));
                 }
             };
             let compare = {
@@ -820,15 +850,11 @@ impl SchemaTree {
         }
     }
 
-    // A table picked in the diagram opens as a table view.
-    pub(crate) fn open_er_diagram(&mut self, schema: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(connection) = &self.connection else { return };
-        let this = cx.entity().downgrade();
-        let name = schema.clone();
-        crate::er_diagram::open(connection.id.clone(), schema, window, cx, move |table, _, cx| {
-            let schema = name.clone();
-            let _ = this.update(cx, |_, cx| cx.emit(SchemaTreeEvent::Browse { schema, table }));
-        });
+    // The diagram opens in a tab of its own, on the workspace's side.
+    pub(crate) fn open_er_diagram(&mut self, schema: String, cx: &mut Context<Self>) {
+        if self.connection.is_some() {
+            cx.emit(SchemaTreeEvent::OpenDiagram { schema });
+        }
     }
 
     // The sync script opens in a tab of the compared connection.
@@ -952,8 +978,7 @@ impl SchemaTree {
         }
     }
 
-    // One item per system view, each opening its query in a new tab and running it. With a table, the views are
-    // that table's and their tabs carry its name.
+    // One item per system view, run in a new tab. With a table, the views are scoped to it.
     fn view_items(
         mut menu: PopupMenu,
         this: &WeakEntity<Self>,
@@ -978,8 +1003,7 @@ impl SchemaTree {
         menu
     }
 
-    // No Insert item since a click already inserts the name. A view's columns only offer Copy. SQLite and
-    // ClickHouse won't drop a key column.
+    // A view's columns only offer Insert and Copy. SQLite and ClickHouse won't drop a key column.
     fn column_menu(
         &self,
         schema: String,
@@ -994,7 +1018,15 @@ impl SchemaTree {
         let driver = self.connection.as_ref().map(|c| c.driver.clone()).unwrap_or_default();
         let droppable = !(primary && matches!(driver, DriverType::Sqlite | DriverType::Turso | DriverType::ClickHouse));
         move |menu, _, cx| {
-            let menu = menu.item(Self::copy_item(column.clone(), cx));
+            let insert = {
+                let (this, name) = (this.clone(), column.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = this.update(cx, |_, cx| cx.emit(SchemaTreeEvent::Insert(name.clone())));
+                }
+            };
+            let menu = menu
+                .item(PopupMenuItem::new(t(cx, "sidebar.insertName")).on_click(insert))
+                .item(Self::copy_item(column.clone(), cx));
             if view {
                 return menu;
             }
@@ -1056,6 +1088,77 @@ impl SchemaTree {
         !matches!(row.kind, RowKind::Note { .. })
     }
 
+    // None for a row that doesn't expand.
+    fn open_state(kind: &RowKind) -> Option<bool> {
+        match kind {
+            RowKind::Schema { expanded, .. } | RowKind::Table { expanded, .. } | RowKind::Group { expanded, .. } => {
+                Some(*expanded)
+            }
+            _ => None,
+        }
+    }
+
+    fn cursor_index(&self) -> Option<usize> {
+        let id = self.cursor.as_ref()?;
+        self.rows.iter().position(|row| &row.id == id)
+    }
+
+    fn put_cursor(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.cursor = Some(self.rows[ix].id.clone());
+        self.keyed = true;
+        self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    // Right opens a closed row, then steps onto its first child.
+    fn expand_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.cursor_index() else { return };
+        let (kind, depth) = (self.rows[ix].kind.clone(), self.rows[ix].depth);
+        match Self::open_state(&kind) {
+            Some(false) => self.activate(kind, cx),
+            Some(true) if self.rows.get(ix + 1).is_some_and(|next| next.depth > depth && Self::focusable(next)) => {
+                self.put_cursor(ix + 1, cx)
+            }
+            _ => {}
+        }
+    }
+
+    // Left closes an open row, or steps up to its parent. A row a search keeps open can't close.
+    fn collapse_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.cursor_index() else { return };
+        let (kind, depth) = (self.rows[ix].kind.clone(), self.rows[ix].depth);
+        let kept_open =
+            matches!(kind, RowKind::Schema { kept_open: true, .. } | RowKind::Table { kept_open: true, .. });
+        if Self::open_state(&kind) == Some(true) && !kept_open {
+            return self.activate(kind, cx);
+        }
+        if let Some(parent) = self.rows[..ix].iter().rposition(|row| row.depth < depth) {
+            self.put_cursor(parent, cx);
+        }
+    }
+
+    // Closes and forgets every open row of the shown connection.
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        let Some(conn) = &self.connection else { return };
+        let prefix = format!("{}:", conn.id);
+        self.expanded_schemas.retain(|key, _| !key.starts_with(&prefix));
+        self.expanded_tables.retain(|key, _| !key.starts_with(&prefix));
+        self.expanded_groups.retain(|key| !key.starts_with(&prefix));
+        set_setting_json(cx, SCHEMA_EXPANDED_KEY, &self.expanded_schemas);
+        set_setting_json(cx, TABLES_EXPANDED_KEY, &self.expanded_tables);
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.rebuild(cx);
+    }
+
+    // Includes tables hidden under a closed schema.
+    fn has_open(&self) -> bool {
+        let Some(conn) = &self.connection else { return false };
+        let prefix = format!("{}:", conn.id);
+        let schemas_and_tables = self.expanded_schemas.iter().chain(&self.expanded_tables);
+        schemas_and_tables.filter(|(_, open)| **open).any(|(key, _)| key.starts_with(&prefix))
+            || self.expanded_groups.iter().any(|key| key.starts_with(&prefix))
+    }
+
     // With no cursor yet, Down starts at the top and Up at the bottom.
     fn move_cursor(&mut self, step: isize, cx: &mut Context<Self>) {
         let focusable: Vec<usize> = (0..self.rows.len()).filter(|&ix| Self::focusable(&self.rows[ix])).collect();
@@ -1068,16 +1171,12 @@ impl SchemaTree {
             (None, _) => last,
             (Some(at), step) => focusable[(at as isize + step).clamp(0, focusable.len() as isize - 1) as usize],
         };
-        self.cursor = Some(self.rows[target].id.clone());
-        self.keyed = true;
-        self.scroll.scroll_to_item(target, ScrollStrategy::Nearest);
-        cx.notify();
+        self.put_cursor(target, cx);
     }
 
     fn activate_cursor(&mut self, cx: &mut Context<Self>) {
-        let row = self.cursor.as_ref().and_then(|id| self.rows.iter().find(|row| &row.id == id)).cloned();
-        if let Some(row) = row {
-            self.activate(row.kind, cx);
+        if let Some(ix) = self.cursor_index() {
+            self.activate(self.rows[ix].kind.clone(), cx);
         }
     }
 
@@ -1097,19 +1196,31 @@ impl SchemaTree {
         let clearance = self.clearance.get(&self.scroll, rems(LIST_INSET.0 + BROWSE_INSET.0), window);
         rows.into_iter()
             .map(|row| {
-                let ring = focused && self.keyed && self.cursor.as_ref() == Some(&row.id);
-                self.render_row(row, ring, clearance, cx)
+                let selected = self.cursor.as_ref() == Some(&row.id);
+                self.render_row(row, selected, focused && self.keyed && selected, clearance, cx)
             })
             .collect()
     }
 
-    // A nested row sits inside its parent's indent, so its hover background starts at the indent.
-    // `clearance` moves a table's Browse button clear of the tree's bar.
-    fn render_row(&self, row: TreeRow, ring: bool, clearance: Pixels, cx: &mut Context<Self>) -> AnyElement {
+    // A nested row sits inside its parent's indent, so its hover background starts there. `selected` marks the
+    // cursor's row, and `clearance` moves a table's Browse button clear of the tree's bar.
+    fn render_row(
+        &self,
+        row: TreeRow,
+        selected: bool,
+        ring: bool,
+        clearance: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
+        // Every chevron takes the larger one's width, so the indent guides run under their centres.
         let chevron = |open: bool, size: Rems| {
-            Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(size)
+            h_flex()
+                .flex_none()
+                .w(ICON_SM)
+                .justify_center()
+                .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(size))
         };
         let icon = |name: Lucide| Icon::new(name).size(ICON_SM).text_color(muted);
         let row_id = row.id.clone();
@@ -1121,11 +1232,12 @@ impl SchemaTree {
             .relative()
             .h(rems(ROW_HEIGHT_REM))
             .w_full()
-            .px(rems(0.462))
+            .px(ROW_PADDING)
             .gap(rems(0.308))
             .rounded(RADIUS)
             .text_size(TEXT_BASE)
             .overflow_hidden()
+            .when(selected, |el| el.bg(theme.sidebar_accent))
             .when(Self::focusable(&row), |el| {
                 // A right-click rings its row, as a key move does, so it's clear which one the menu is for.
                 let (left, right) = (row_id.clone(), row_id);
@@ -1154,107 +1266,145 @@ impl SchemaTree {
         let mono = |el: Div| el.font_family(theme.mono_font_family.clone());
         let badge = |text: SharedString, color: Hsla| form::badge(text, color);
         let count = |text: String| div().flex_none().text_size(TEXT_2XS).text_color(muted).child(text);
-        let element = match row.kind {
-            RowKind::Schema { name, expanded, count: tables } => {
-                let menu = self.schema_menu(name.clone(), cx);
-                clickable(base)
-                    .child(chevron(expanded, ICON_SM))
-                    .child(icon(Lucide::FolderOpen))
-                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
-                    .children(tables.map(count))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_schema(&name, cx)))
-                    .context_menu(menu)
-                    .into_any_element()
-            }
-            RowKind::Table { schema, table, expanded } => {
-                let kind = ObjectKind::for_relation(&table.kind);
-                let is_view = kind != ObjectKind::Table;
-                let menu = self.table_menu(schema.clone(), table.clone(), cx);
-                let name = table.name.clone();
-                let group = SharedString::from(format!("schema-table-{}-{}", schema, table.name));
-                let browse = self.browse_action(&schema, &table.name, group.clone(), ring, clearance, cx);
-                clickable(base)
-                    .group(group)
-                    .child(chevron(expanded, ICON_SM))
-                    .child(
-                        Icon::new(if is_view { Lucide::View } else { Lucide::Table2 })
-                            .size(ICON_SM)
-                            .text_color(if is_view { theme.primary } else { muted }),
-                    )
-                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
-                    .when(is_view, |el| el.child(badge(t(cx, "sidebar.badge.view"), theme.primary)))
-                    .child(browse)
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_table(&schema, &name, cx)))
-                    .context_menu(menu)
-                    .into_any_element()
-            }
-            RowKind::Column { column, matched, schema, table, view } => {
-                let menu = self.column_menu(schema, table, column.name.clone(), view, column.is_primary, cx);
-                let insert = column.name.clone();
-                column_row(clickable(base))
-                    .when(matched, |el| el.bg(theme.primary.opacity(TINT)))
-                    .child(icon(Lucide::Columns3))
-                    .child(
-                        mono(div())
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(if matched { theme.primary } else { theme.foreground })
-                            .child(column.name.clone()),
-                    )
-                    .when(column.is_primary, |el| el.child(badge(t(cx, "sidebar.pk"), theme.primary)))
-                    .when(column.is_foreign, |el| el.child(badge(t(cx, "sidebar.fk"), theme.warning)))
-                    .child(
-                        mono(div()).flex_none().text_size(TEXT_2XS).text_color(muted).child(column.data_type.clone()),
-                    )
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(SchemaTreeEvent::Insert(insert.clone()))))
-                    .context_menu(menu)
-                    .into_any_element()
-            }
-            RowKind::Group { key, group, schema, table, expanded, count: objects } => clickable(base)
-                .text_size(TEXT_SM)
-                .text_color(muted)
-                .child(chevron(expanded, ICON_XS))
-                .child(icon(group_icon(group)))
-                .child(div().flex_1().min_w_0().truncate().child(t(cx, &format!("sidebar.group.{}", group.key()))))
-                .children(objects.map(|n| count(n.to_string())))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_group(key.clone(), group, schema.clone(), table.clone(), cx)
-                }))
-                .into_any_element(),
-            RowKind::Object { row, group, schema, table } => {
-                let menu = self.object_menu(&row, schema, table, cx);
-                let badge_color = match row.badge {
-                    Some(Badge::Pk) => theme.primary,
-                    Some(Badge::Fk | Badge::Check) => theme.warning,
-                    Some(Badge::Unique) => theme.success,
-                    _ => muted,
-                };
-                column_row(base)
-                    .hover(|s| s.bg(hover))
-                    .child(icon(group_icon(group)))
-                    .child(mono(div()).flex_shrink_0().max_w(relative(0.7)).truncate().child(row.label.clone()))
-                    .children(row.badge.map(|b| badge(t(cx, &format!("sidebar.badge.{}", b.key())), badge_color)))
-                    .child(
-                        mono(div())
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(TEXT_2XS)
-                            .text_color(muted)
-                            .child(row.detail.clone()),
-                    )
-                    .context_menu(menu)
-                    .into_any_element()
-            }
-            RowKind::Note { text, spinner } => column_row(base)
-                .text_color(muted)
-                .when(spinner, |el| el.child(Spinner::new(ICON_XS)))
-                .child(div().min_w_0().truncate().child(text))
-                .into_any_element(),
+        // A search marks what it matched in names and types, so the rows it keeps read as they do unsearched.
+        let highlight = HighlightStyle {
+            color: Some(theme.primary),
+            background_color: Some(theme.primary.opacity(TINT)),
+            font_weight: Some(FontWeight::MEDIUM),
+            ..Default::default()
         };
+        let marked = |text: SharedString, needle: &str| {
+            let ranges = match_ranges(&text, needle);
+            StyledText::new(text).with_highlights(ranges.into_iter().map(|range| (range, highlight)))
+        };
+        let element =
+            match row.kind {
+                RowKind::Schema { name, expanded, count: tables, .. } => {
+                    let menu = self.schema_menu(name.clone(), cx);
+                    clickable(base)
+                        .child(chevron(expanded, ICON_SM))
+                        .child(icon(Lucide::FolderOpen))
+                        .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                        .children(tables.map(count))
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_schema(&name, cx)))
+                        .context_menu(menu)
+                        .into_any_element()
+                }
+                RowKind::Table { schema, table, expanded, .. } => {
+                    let (relation_icon, relation_badge) = relation_look(&ObjectKind::for_relation(&table.kind));
+                    let active = self.active_table.as_ref().is_some_and(|active| {
+                        self.connection.as_ref().is_some_and(|c| c.id == active.connection_id)
+                            && active.schema == schema
+                            && active.table == table.name
+                    });
+                    let menu = self.table_menu(schema.clone(), table.clone(), cx);
+                    let name = table.name.clone();
+                    let group = SharedString::from(format!("schema-table-{}-{}", schema, table.name));
+                    let browse = self.browse_action(&schema, &table.name, group.clone(), ring, clearance, cx);
+                    clickable(base)
+                        .group(group)
+                        .child(chevron(expanded, ICON_SM))
+                        .child(Icon::new(relation_icon).size(ICON_SM).text_color(if relation_badge.is_some() {
+                            theme.primary
+                        } else {
+                            muted
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(marked(name.clone().into(), &self.needle)))
+                        .children(relation_badge.map(|key| badge(t(cx, key), theme.primary)))
+                        .when(active, |el| {
+                            el.child(
+                                div()
+                                    .debug_selector(|| "open-table".into())
+                                    .flex_none()
+                                    .size(rems(0.462))
+                                    .rounded_full()
+                                    .bg(theme.primary),
+                            )
+                        })
+                        .child(browse)
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_table(&schema, &name, cx)))
+                        .context_menu(menu)
+                        .into_any_element()
+                }
+                RowKind::Column { column, schema, table, view } => {
+                    let menu = self.column_menu(schema, table, column.name.clone(), view, column.is_primary, cx);
+                    let tip = column.clone();
+                    let dialect = self.connection.as_ref().and_then(|c| c.driver.dialect());
+                    let icon_color = match (column.is_primary, column.is_foreign) {
+                        (true, _) => theme.warning,
+                        (false, true) => theme.primary,
+                        _ => muted,
+                    };
+                    column_row(clickable(base))
+                        .child(Icon::new(column_icon(&column, dialect)).size(ICON_SM).text_color(icon_color))
+                        .child(
+                            mono(div())
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.foreground)
+                                .child(marked(column.name.clone().into(), &self.needle)),
+                        )
+                        .child(mono(div()).flex_none().text_size(TEXT_2XS).text_color(muted).child(marked(
+                            type_label(&column, dialect).into(),
+                            type_needle(&column.name, &self.needle),
+                        )))
+                        .tooltip(move |window, cx| {
+                            let column = tip.clone();
+                            Tooltip::element(move |_, cx| column_tip(&column, cx)).build(window, cx)
+                        })
+                        .context_menu(menu)
+                        .into_any_element()
+                }
+                RowKind::Group { key, group, schema, table, expanded, count: objects } => clickable(base)
+                    .text_size(TEXT_SM)
+                    .text_color(muted)
+                    .child(chevron(expanded, ICON_XS))
+                    .child(icon(group_icon(group)))
+                    .child(div().flex_1().min_w_0().truncate().child(t(cx, &format!("sidebar.group.{}", group.key()))))
+                    .children(objects.map(|n| count(n.to_string())))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_group(key.clone(), group, schema.clone(), table.clone(), cx)
+                    }))
+                    .into_any_element(),
+                RowKind::Object { row, schema, table } => {
+                    let menu = self.object_menu(&row, schema, table, cx);
+                    let badge_color = match row.badge {
+                        Some(Badge::Pk) => theme.warning,
+                        Some(Badge::Fk) => theme.primary,
+                        Some(Badge::Unique) => theme.success,
+                        _ => muted,
+                    };
+                    // The group's row already shows its icon, and every index would say IDX, so neither repeats here.
+                    let shown_badge = row.badge.filter(|badge| *badge != Badge::Index);
+                    column_row(base)
+                        .hover(|s| s.bg(hover))
+                        .child(mono(div()).flex_shrink_0().max_w(relative(0.7)).truncate().child(row.label.clone()))
+                        .children(shown_badge.map(|b| badge(t(cx, &format!("sidebar.badge.{}", b.key())), badge_color)))
+                        .child(
+                            mono(div())
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(TEXT_2XS)
+                                .text_color(muted)
+                                .child(row.detail.clone()),
+                        )
+                        .context_menu(menu)
+                        .into_any_element()
+                }
+                RowKind::Note { text, spinner } => column_row(base)
+                    .text_color(muted)
+                    .when(spinner, |el| el.child(Spinner::new(ICON_XS)))
+                    .child(div().min_w_0().truncate().child(text))
+                    .into_any_element(),
+            };
         let element = div().w_full().child(element).when(ring, |el| list_nav::ring(el, cx));
-        div().w_full().pl(rems(INDENT_REM * depth as f32)).child(element).into_any_element()
+        // Each open parent's guide runs down from its chevron, past the rows it holds.
+        let guide_left = |level: usize| rems(INDENT_REM * level as f32 + ROW_PADDING.0 + ICON_SM.0 / 2.);
+        let guides = (0..depth)
+            .map(|level| div().absolute().top_0().bottom_0().left(guide_left(level)).w(px(1.)).bg(theme.border));
+        div().relative().w_full().pl(rems(INDENT_REM * depth as f32)).children(guides).child(element).into_any_element()
     }
 
     // Sits over the row's end on a gradient that fades out the truncated name.
@@ -1311,7 +1461,7 @@ impl SchemaTree {
                     )
                     .tooltip({
                         let hint = t(cx, "sidebar.browseData");
-                        move |window, cx| gpui_kit::component::tooltip::Tooltip::new(hint.clone()).build(window, cx)
+                        move |window, cx| Tooltip::new(hint.clone()).build(window, cx)
                     })
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.stop_propagation();
@@ -1323,29 +1473,10 @@ impl SchemaTree {
     fn filter_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let enabled = self.connected(cx);
         let loading = self.connection.as_ref().is_some_and(|c| schema::get(cx, &c.id).is_some_and(|d| d.loading()));
-        let driver = self.connection.as_ref().map(|c| c.driver.clone()).unwrap_or_default();
-        let server_views = views(&driver, ViewScope::Server).next().is_some();
-        let this = cx.entity().downgrade();
         let field = div()
             .debug_selector(|| "schema-search".into())
             .child(form::filter_input(&self.search, window, cx).cleanable(true).disabled(!enabled));
         form::filter_bar(field, cx)
-            .child(
-                form::filter_button("import-data", Icon::new(Lucide::Upload))
-                    .debug_selector(|| "import-data".into())
-                    .tooltip(t(cx, "sidebar.importData"))
-                    .disabled(!enabled || !self.writable())
-                    .on_click(cx.listener(|this, _, window, cx| this.import_default(window, cx))),
-            )
-            .when(server_views, |bar| {
-                bar.child(
-                    form::filter_button("server-views", Icon::new(Lucide::Activity))
-                        .debug_selector(|| "server-views".into())
-                        .tooltip(t(cx, "sidebar.serverViews"))
-                        .disabled(!enabled)
-                        .dropdown_menu(move |menu, _, cx| Self::view_items(menu, &this, &driver, None, cx)),
-                )
-            })
             .child(
                 form::filter_button("refresh-schema", Icon::new(Lucide::RefreshCw))
                     .debug_selector(|| "refresh-schema".into())
@@ -1353,6 +1484,45 @@ impl SchemaTree {
                     .disabled(self.connection.is_none() || loading)
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
+            .child(self.options_menu(enabled, cx))
+    }
+
+    fn options_menu(&self, enabled: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let this = cx.entity().downgrade();
+        let (open, writable) = (self.has_open(), self.writable());
+        let driver = self.connection.as_ref().map(|c| c.driver.clone()).unwrap_or_default();
+        let server_views = views(&driver, ViewScope::Server).next().is_some();
+        form::filter_button("schema-options", Icon::new(Lucide::SlidersHorizontal))
+            .debug_selector(|| "schema-options".into())
+            .tooltip(t(cx, "sidebar.schemaOptions"))
+            .disabled(!enabled)
+            .dropdown_menu(move |menu: PopupMenu, window, cx| {
+                let (collapse, import, views_for) = (this.clone(), this.clone(), this.clone());
+                let driver = driver.clone();
+                menu.item(
+                    PopupMenuItem::new(t(cx, "sidebar.collapseAll"))
+                        .icon(Icon::new(Lucide::ChevronsDownUp))
+                        .disabled(!open)
+                        .on_click(move |_, _, cx| {
+                            let _ = collapse.update(cx, |tree, cx| tree.collapse_all(cx));
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(t(cx, "sidebar.importData"))
+                        .icon(Icon::new(Lucide::Upload))
+                        .disabled(!writable)
+                        .on_click(move |_, window, cx| {
+                            let _ = import.update(cx, |tree, cx| tree.import_default(window, cx));
+                        }),
+                )
+                .when(server_views, |menu| {
+                    let label = t(cx, "sidebar.serverViews");
+                    menu.submenu_with_icon(Some(Icon::new(Lucide::Activity)), label, window, cx, move |menu, _, cx| {
+                        Self::view_items(menu, &views_for, &driver, None, cx)
+                    })
+                })
+            })
     }
 
     fn error_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1396,9 +1566,115 @@ fn note(parent: &str, depth: usize, text: SharedString, spinner: bool) -> TreeRo
     TreeRow { id: format!("n:{parent}").into(), depth, kind: RowKind::Note { text, spinner } }
 }
 
+// Tooltip lines: FK target, NOT NULL and default as the hover card words them, auto-generated or computed, and
+// enum values.
+fn column_details(column: &ColumnInfo, cx: &App) -> Vec<String> {
+    let labels = cx.global::<I18n>().sql_labels();
+    let flag = |on: bool, key: &str| if on { t(cx, key).to_string() } else { String::new() };
+    let mut lines = vec![hover_card::joined([
+        hover_card::column_note(column, &labels, cx),
+        flag(column.is_identity, "sidebar.columnTip.identity"),
+        flag(column.is_computed, "sidebar.columnTip.computed"),
+    ])];
+    if !column.enum_values.is_empty() {
+        let mut values = column.enum_values.iter().take(TIP_VALUES).map(String::as_str).collect::<Vec<_>>().join(", ");
+        if column.enum_values.len() > TIP_VALUES {
+            values.push_str(", …");
+        }
+        lines.push(t_with(cx, "sidebar.columnTip.values", &[("values", &values)]).to_string());
+    }
+    lines.retain(|line| !line.is_empty());
+    lines
+}
+
+// Full name and type, which the row may truncate, then the details.
+fn column_tip(column: &ColumnInfo, cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .py(rems(0.231))
+        .gap(rems(0.154))
+        .child(
+            h_flex()
+                .gap(rems(0.462))
+                .font_family(theme.mono_font_family.clone())
+                .child(div().font_semibold().child(column.name.clone()))
+                .child(div().text_color(theme.muted_foreground).child(column.data_type.clone())),
+        )
+        .children(
+            column_details(column, cx)
+                .into_iter()
+                .map(|line| div().text_size(TEXT_XS).text_color(theme.muted_foreground).child(line)),
+        )
+}
+
+// Each place a search's needle shows up in `text`, as byte ranges of `text`. The needle comes lowercased, and a
+// letter can lowercase to more bytes, so each lowercased byte keeps the span of the letter it came from.
+fn match_ranges(text: &str, needle: &str) -> Vec<Range<usize>> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let (mut lower, mut spans) = (String::with_capacity(text.len()), Vec::with_capacity(text.len()));
+    for (at, letter) in text.char_indices() {
+        for lowered in letter.to_lowercase() {
+            lower.push(lowered);
+            spans.extend(std::iter::repeat_n(at..at + letter.len_utf8(), lowered.len_utf8()));
+        }
+    }
+    lower.match_indices(needle).map(|(at, found)| spans[at].start..spans[at + found.len() - 1].end).collect()
+}
+
+// What a column's type is marked with: the needle, unless its name already shows why the column is listed.
+fn type_needle<'a>(name: &str, needle: &'a str) -> &'a str {
+    if match_ranges(name, needle).is_empty() { needle } else { "" }
+}
+
+// Keys look as they do in the ER diagram and the grid's headers: a gold key, a blue link. Other columns show what
+// their type holds, or a list when they take their values from a fixed one.
+fn column_icon(column: &ColumnInfo, dialect: Option<SqlDialect>) -> Lucide {
+    if column.is_primary {
+        return Lucide::KeyRound;
+    }
+    if column.is_foreign {
+        return Lucide::Link;
+    }
+    if !column.enum_values.is_empty() {
+        return Lucide::List;
+    }
+    match type_family(dialect, &column.data_type) {
+        TypeFamily::Number => Lucide::Hash,
+        TypeFamily::Text => Lucide::CaseSensitive,
+        TypeFamily::Boolean => Lucide::ToggleLeft,
+        TypeFamily::Date => Lucide::Calendar,
+        TypeFamily::Time => Lucide::Clock,
+        TypeFamily::DateTime => Lucide::CalendarClock,
+        TypeFamily::Json => Lucide::Braces,
+        TypeFamily::Uuid => Lucide::FingerprintPattern,
+        TypeFamily::Binary => Lucide::Binary,
+        TypeFamily::Array => Lucide::Brackets,
+        TypeFamily::Enum => Lucide::List,
+        TypeFamily::Other => Lucide::Columns3,
+    }
+}
+
+// A nullable column's type ends in `?`, unless the type says so itself, as ClickHouse's Nullable(…) does.
+fn type_label(column: &ColumnInfo, dialect: Option<SqlDialect>) -> String {
+    let shown = display_type(dialect, &column.data_type);
+    if column.is_nullable && !shown.contains("Nullable(") { format!("{shown}?") } else { shown }
+}
+
+// A materialized view stores its rows, so it doesn't pass for a view.
+fn relation_look(kind: &ObjectKind) -> (Lucide, Option<&'static str>) {
+    match kind {
+        ObjectKind::View => (Lucide::View, Some("sidebar.badge.view")),
+        ObjectKind::MaterializedView => (Lucide::Layers, Some("sidebar.badge.matview")),
+        _ => (Lucide::Table2, None),
+    }
+}
+
+// Indexes don't take `#`, which marks number columns.
 fn group_icon(group: Group) -> Lucide {
     match group {
-        Group::Indexes => Lucide::Hash,
+        Group::Indexes => Lucide::ListTree,
         Group::Constraints => Lucide::KeyRound,
         Group::Triggers => Lucide::Zap,
         Group::Routines => Lucide::SquareFunction,
@@ -1454,6 +1730,8 @@ impl Render for SchemaTree {
                 .on_action(cx.listener(|this, _: &CursorFirst, _, cx| this.move_cursor(isize::MIN, cx)))
                 .on_action(cx.listener(|this, _: &CursorLast, _, cx| this.move_cursor(isize::MAX, cx)))
                 .on_action(cx.listener(|this, _: &ActivateRow, _, cx| this.activate_cursor(cx)))
+                .on_action(cx.listener(|this, _: &CollapseRow, _, cx| this.collapse_cursor(cx)))
+                .on_action(cx.listener(|this, _: &ExpandRow, _, cx| this.expand_cursor(cx)))
                 .child(
                     uniform_list("schema-tree", self.rows.len(), cx.processor(Self::render_rows))
                         .debug_selector(|| "schema-tree".into())

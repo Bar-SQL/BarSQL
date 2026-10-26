@@ -206,7 +206,7 @@ fn ran_in_new_tab(app: &mut Driver, tabs: usize, title: &str) {
     assert_eq!(app.titles().len(), tabs + 1);
     assert_eq!(app.titles().last().map(String::as_str), Some(title));
     app.wait_idle();
-    assert!(!app.status_is_error(), "{:?}", app.error());
+    assert!(app.error().is_none(), "{:?}", app.error());
     assert!(app.grid().is_some(), "a grid of the view's rows");
 }
 
@@ -316,16 +316,13 @@ fn browse_rows(cx: &mut TestAppContext, engine: Engine) {
     assert_eq!(column(&mut app, 1), [Some("Alice".into()), Some("Bob".into())]);
 }
 
-// The filter bar's button lists the server views. SQLite keeps no statistics, so Turso has no button.
+// SQLite keeps no statistics, so Turso has no server views.
 fn server_views(cx: &mut TestAppContext, engine: Engine) {
+    let Some(first) = views(&engine.driver(), ViewScope::Server).next() else { return };
     let mut app = open_on(cx, engine);
     app.connect();
-    let Some(first) = views(&engine.driver(), ViewScope::Server).next() else {
-        assert!(app.cx.debug_bounds("server-views").is_none(), "no views, so no button");
-        return;
-    };
     let (tabs, title) = (app.titles().len(), label(&mut app, first));
-    app.menu_pick("server-views", 0);
+    app.menu_submenu("schema-options", 2, 0);
     ran_in_new_tab(&mut app, tabs, &title);
 }
 
@@ -382,6 +379,8 @@ fn foreign_key(cx: &mut TestAppContext, engine: Engine) {
     app.refresh_schema();
     browse(&mut app, &child);
     let grid = grid(&mut app);
+    // Where the key leads comes in a load of its own, after the rows.
+    app.settle(|cx| cx.update(|_, cx| grid.read(cx).jumps_at(0, 1)));
     let at = app.grid_point(&grid, |grid| grid.jump_point(0, 1));
     let buttons = app.cx.update(|_, cx| {
         let grid = grid.read(cx);
@@ -413,6 +412,7 @@ fn text_foreign_key(cx: &mut TestAppContext, engine: Engine) {
     app.refresh_schema();
     browse(&mut app, &child);
     let grid = grid(&mut app);
+    app.settle(|cx| cx.update(|_, cx| grid.read(cx).jumps_at(0, 1)));
     let at = app.grid_point(&grid, |grid| grid.jump_point(0, 1));
     app.click_at(at, Modifiers::none());
     let workspace = app.workspace.clone();
@@ -604,7 +604,6 @@ mod postgres_only {
         let mut app = open_on(cx, Engine::Postgres);
         app.connect();
         app.run("SELECT nonexistent_func_e2e();");
-        assert!(app.status_is_error());
         let info = app.error().and_then(|error| error.info).expect("the error card");
         assert_eq!(info.code, "42883");
         assert!(info.message.contains("nonexistent_func_e2e") && info.hint.contains("No function matches"), "{info:?}");

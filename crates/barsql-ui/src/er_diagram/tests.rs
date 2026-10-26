@@ -2,7 +2,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use barsql_core::ColumnInfo;
+use barsql_core::{ColumnInfo, ConnectionConfig};
 use gpui_kit::component::Root;
 use gpui_kit::{
     AppContext as _, Bounds, Entity, Modifiers, MouseButton, PinchEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent,
@@ -58,7 +58,8 @@ fn diagram(cx: &mut TestAppContext, tables: Tables) -> (Entity<ErDiagram>, Opene
     let (out, record) = (slot.clone(), opened.clone());
     let window = cx.add_window(move |window, cx| {
         let on_open: super::OnOpen = Rc::new(move |name, _, _| record.borrow_mut().push(name));
-        let view = cx.new(|cx| ErDiagram::new("c".into(), "main".into(), on_open, window, cx));
+        let connection = ConnectionConfig { id: "c".into(), ..Default::default() };
+        let view = cx.new(|cx| ErDiagram::new("er".into(), connection, "main".into(), on_open, window, cx));
         *out.borrow_mut() = Some(view.clone());
         Root::new(view, window, cx)
     });
@@ -121,6 +122,14 @@ fn under(view: &Entity<ErDiagram>, at: Point<Pixels>, cx: &mut VisualTestContext
 fn a_small_schema_opens_at_full_size(cx: &mut TestAppContext) {
     let (view, _, cx) = diagram(cx, small());
     assert_eq!(zoom_of(&view, cx), 1.);
+}
+
+// How to get around sits behind a "?" instead of along the toolbar.
+#[gpui_kit::test]
+fn the_toolbar_keeps_its_hint_behind_a_help_button(cx: &mut TestAppContext) {
+    let (_, _, cx) = diagram(cx, small());
+    bounds(cx, "er-help");
+    assert!(cx.debug_bounds("er-note").is_none(), "nothing to say while every table shows");
 }
 
 // It opens fitted, unless that would be too small to read. Fit then shows it all.

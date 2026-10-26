@@ -2,20 +2,21 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::tokens::RADIUS;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
-use gpui_kit::component::{ActiveTheme, h_flex};
+use gpui_kit::component::{ActiveTheme, Icon, Sizable, h_flex};
 use gpui_kit::*;
 
-// The sidebar lists' padding. Saved, Recent and the Schema tree pad the list by it, and connection rows pad
-// themselves by it.
+// Padding of the sidebar lists.
 pub const LIST_INSET: Rems = rems(0.615);
 // The padding of a Saved or Recent row inside its list.
 pub const ROW_INSET: Rems = rems(0.5);
 
-// Keyboard navigation for the sidebar lists. Delete triggers the row's delete button.
+// Keyboard navigation for the sidebar lists. Delete deletes the row and F2 renames it, where the list allows.
 pub const CONTEXT: &str = "ListNav";
 
-actions!(list_nav, [NavUp, NavDown, NavFirst, NavLast, NavOpen, NavDelete]);
+actions!(list_nav, [NavUp, NavDown, NavFirst, NavLast, NavOpen, NavDelete, NavRename]);
 
 pub fn init(cx: &mut App) {
     let context = Some(CONTEXT);
@@ -27,27 +28,51 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", NavOpen, context),
         KeyBinding::new("space", NavOpen, context),
         KeyBinding::new("delete", NavDelete, context),
+        KeyBinding::new("f2", NavRename, context),
     ]);
 }
 
-// Rings the cursor row only after a key moves it, not after a click or when the list takes focus.
-pub struct ListNav {
+// Rings the cursor row only after a key moves it, not on a click or focus. `S` is the list's scroll handle.
+pub struct ListNav<S = ScrollHandle> {
     pub focus: FocusHandle,
-    pub scroll: ScrollHandle,
+    pub scroll: S,
     pub clearance: BarClearance,
     cursor: Option<String>,
     keyed: bool,
 }
 
+// A list's scroll handle, which can bring a row into view.
+pub trait NavScroll: ScrollbarHandle + Clone {
+    fn reveal(&self, ix: usize);
+}
+
+impl NavScroll for ScrollHandle {
+    fn reveal(&self, ix: usize) {
+        self.scroll_to_item(ix);
+    }
+}
+
+impl NavScroll for UniformListScrollHandle {
+    fn reveal(&self, ix: usize) {
+        self.scroll_to_item(ix, ScrollStrategy::Nearest);
+    }
+}
+
+impl NavScroll for ListState {
+    fn reveal(&self, ix: usize) {
+        self.scroll_to_reveal_item(ix);
+    }
+}
+
 impl ListNav {
     pub fn new(cx: &mut App) -> Self {
-        Self {
-            focus: cx.focus_handle(),
-            scroll: ScrollHandle::new(),
-            clearance: BarClearance::default(),
-            cursor: None,
-            keyed: false,
-        }
+        Self::with_scroll(ScrollHandle::new(), cx)
+    }
+}
+
+impl<S: NavScroll> ListNav<S> {
+    pub fn with_scroll(scroll: S, cx: &mut App) -> Self {
+        Self { focus: cx.focus_handle(), scroll, clearance: BarClearance::default(), cursor: None, keyed: false }
     }
 
     pub fn focus_list(&mut self, window: &mut Window, cx: &mut App) {
@@ -86,7 +111,7 @@ impl ListNav {
         };
         self.cursor = Some(target.0.clone());
         self.keyed = true;
-        self.scroll.scroll_to_item(target.1);
+        self.scroll.reveal(target.1);
     }
 
     pub fn ringed(&self, id: &str, window: &Window) -> bool {
@@ -102,14 +127,17 @@ impl ListNav {
         window: &Window,
         cx: &App,
     ) -> Div {
-        let clearance = self.clearance.get(&self.scroll, rems(row_inset.0 + list_inset.0), window);
-        hover_actions(group, row_inset, cx).pr(clearance)
+        hover_actions(group, row_inset, cx).pr(self.clearance(row_inset, list_inset, window))
+    }
+
+    // How far `hover_actions` move clear of the list's bar. A `list` reads this before building its rows.
+    pub fn clearance(&self, row_inset: Rems, list_inset: Rems, window: &Window) -> Pixels {
+        self.clearance.get(&self.scroll, rems(row_inset.0 + list_inset.0), window)
     }
 }
 
-// A shown bar takes clicks on its track, so buttons at the end of a list's rows move clear of it while the list can
-// scroll. Rows are built before the frame's layout, from the frame before's, so `watch` draws them again on the frame
-// the list starts or stops scrolling.
+// A visible scrollbar takes clicks on its track, so row-end buttons move clear of it while the list scrolls. Rows are
+// built from the previous frame's layout, so `watch` redraws them when scrolling starts or stops.
 #[derive(Clone, Default)]
 pub struct BarClearance(Rc<Cell<bool>>);
 
@@ -153,9 +181,14 @@ pub fn ring<E: ParentElement + Styled>(el: E, cx: &App) -> E {
     el.relative().child(div().absolute().inset_0().rounded(RADIUS).border_2().border_color(cx.theme().primary))
 }
 
-// Small buttons over the end of a relative row, shown while `group` is hovered. Absolute, so the row's text has
-// its whole width until then. `inset` is the row's right padding.
-fn hover_actions(group: impl Into<SharedString>, inset: Rems, cx: &App) -> Div {
+// A button for `hover_actions`. Keeps the row's pointing hand instead of GPUI Kit's arrow.
+pub fn row_button(id: impl Into<ElementId>, icon: Lucide) -> Button {
+    Button::new(id).small().icon(Icon::new(icon)).cursor_pointer()
+}
+
+// Buttons over the end of a row, shown while `group` is hovered. Absolute, so the text keeps its full width. `inset`
+// is the row's right padding.
+pub fn hover_actions(group: impl Into<SharedString>, inset: Rems, cx: &App) -> Div {
     h_flex()
         .absolute()
         .top_0()
@@ -249,6 +282,27 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn f2_renames_the_saved_query_under_the_cursor(cx: &mut TestAppContext) {
+        let env = Env::new(cx);
+        let query = SavedQuery {
+            name: "Alpha".into(),
+            connection_id: env.connection.id.clone(),
+            sql: "SELECT 1".into(),
+            ..Default::default()
+        };
+        env.bar.save_saved_query(query).unwrap();
+        cx.update(saved_queries::refresh);
+        let (panel, cx) = in_root(cx, SavedPanel::new);
+        let (id, connections) = (env.connection.id.clone(), env.bar.list_connections());
+        panel.update(cx, |panel, cx| panel.set_connection(Some(id), connections, cx));
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| panel.focus_list(window, cx));
+        cx.simulate_keystrokes("down f2");
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)), "F2 asks for the new name");
+    }
+
+    #[gpui_kit::test]
     fn history_entries_open_from_the_keyboard(cx: &mut TestAppContext) {
         let env = Env::new(cx);
         let (panel, cx) = in_root(cx, HistoryPanel::new);
@@ -276,6 +330,64 @@ mod tests {
         cx.simulate_keystrokes("end enter");
         cx.run_until_parked();
         assert_eq!(*opened.borrow(), ["SELECT 2"]);
+    }
+
+    // Only the rows on screen are built, so a long list scrolls as lightly as a short one.
+    #[gpui_kit::test]
+    fn a_long_history_builds_only_the_rows_on_screen(cx: &mut TestAppContext) {
+        let env = Env::new(cx);
+        let (panel, cx) = in_root(cx, HistoryPanel::new);
+        let now = jiff::Timestamp::now();
+        let entries = (0..200)
+            .map(|n| HistoryEntry {
+                id: format!("h{n}"),
+                connection_id: env.connection.id.clone(),
+                sql: format!("SELECT {n}"),
+                executed_at: (now - jiff::SignedDuration::from_mins(n * 37)).to_string(),
+                success: true,
+                ..Default::default()
+            })
+            .collect();
+        panel.update(cx, |panel, cx| panel.show_entries(entries, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("history-row-0").is_some(), "the first run is on screen");
+        assert!(cx.debug_bounds("history-row-150").is_none(), "a run far below isn't built");
+        panel.update_in(cx, |panel, window, cx| panel.focus_list(window, cx));
+        cx.simulate_keystrokes("end");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("history-row-199").is_some(), "End scrolls to the last run");
+    }
+
+    #[gpui_kit::test]
+    fn a_long_saved_list_builds_only_the_rows_on_screen(cx: &mut TestAppContext) {
+        let env = Env::new(cx);
+        for n in 0..200 {
+            let query = SavedQuery {
+                name: format!("Query {n:03}"),
+                connection_id: env.connection.id.clone(),
+                sql: format!("SELECT {n}"),
+                ..Default::default()
+            };
+            env.bar.save_saved_query(query).unwrap();
+        }
+        cx.update(saved_queries::refresh);
+        let (panel, cx) = in_root(cx, SavedPanel::new);
+        let (id, connections) = (env.connection.id.clone(), env.bar.list_connections());
+        panel.update(cx, |panel, cx| panel.set_connection(Some(id), connections, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("saved-row-0").is_some(), "the first query is on screen");
+        assert!(cx.debug_bounds("saved-row-150").is_none(), "a query far below isn't built");
+        panel.update_in(cx, |panel, window, cx| panel.focus_list(window, cx));
+        cx.simulate_keystrokes("end");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("saved-row-199").is_some(), "End scrolls to the last query");
+    }
+
+    #[test]
+    fn row_buttons_keep_the_rows_hand() {
+        use gpui_kit::Styled as _;
+        let mut button = super::row_button("delete", gpui_kit::assets::IconName::Trash);
+        assert_eq!(button.style().mouse_cursor, Some(gpui_kit::CursorStyle::PointingHand));
     }
 
     #[gpui_kit::test]
