@@ -143,6 +143,9 @@
     "planHideQuiet": "Скрий 0 и false"
   },
   "sidebar": {
+    "newTable": "Нова таблица…",
+    "editStructure": "Редактиране на структурата…",
+    "viewStructure": "Преглед на структурата",
     "badge": {
       "matview": "MATVIEW"
     },
@@ -224,6 +227,7 @@
     "showAllColumns": "Покажи всички колони"
   },
   "tableView": {
+    "structure": "Структура",
     "markRows": "Маркирай {{count}} ред за изтриване",
     "markRows_other": "Маркирай {{count}} реда за изтриване",
     "unmarkRows": "Премахни маркировката за изтриване от {{count}} ред",
@@ -279,6 +283,8 @@
     "exportStopped_other": "Експортирането е спряно - {{fileName}} съдържа само първите {{count}} реда"
   },
   "menu": {
+    "editTableStructure": "Редактиране на структурата на таблицата",
+    "newTable": "Нова таблица",
     "toggleSidebar": "Странична лента",
     "toggleJsonPanel": "JSON преглед",
     "undo": "Отмени",
@@ -445,5 +451,103 @@
     "license": "Лиценз {{name}}",
     "madeWith": "Създаден с",
     "checkUpdates": "Проверка за актуализации"
+  },
+  "structure": {
+    "foreignKey": {
+      "name": "Име",
+      "columns": "Колони",
+      "table": "Сочи към",
+      "refColumns": "Целеви колони",
+      "onUpdate": "При промяна",
+      "onDelete": "При изтриване"
+    },
+    "action": {
+      "noAction": "Без действие",
+      "restrict": "Забрани",
+      "cascade": "Каскадно",
+      "setNull": "Задай NULL",
+      "setDefault": "Задай по подразбиране"
+    },
+    "check": {
+      "name": "Име",
+      "expression": "Условие"
+    },
+    "index": {
+      "name": "Име",
+      "columns": "Колони",
+      "unique": "Уникален",
+      "method": "Метод",
+      "definition": "Дефиниция",
+      "constraint": "Ограничение"
+    },
+    "discardTitle": "Отхвърляне на промените в структурата?",
+    "discardDescription_one": "Един раздел има неприложени промени в структурата. При затваряне те се губят.",
+    "discardDescription_other": "{{count}} раздела имат неприложени промени в структурата. При затваряне те се губят.",
+    "discardConfirm": "Отхвърли промените",
+    "newTableTitle": "Нова таблица",
+    "tableName": "Име на таблицата",
+    "tableNamePlaceholder": "напр. customers",
+    "applyTitle": "Прилагане на промените в структурата",
+    "applyConfirm": "Приложи",
+    "applied": "Структурата на {{name}} е променена",
+    "rebuildWarning": "SQLite не може да промени това на място, затова таблицата се изгражда наново и редовете ѝ се копират.",
+    "notAtomicWarning": "Тази база данни не може да отменя промени в схемата: ако заявка се провали, предишните остават.",
+    "gone": "Тази таблица вече не съществува.",
+    "stale": "Таблицата е променена другаде. Презаредете, за да я видите – промените тук ще се загубят.",
+    "reload": "Презареди",
+    "addRow": {
+      "column": "Добави колона",
+      "index": "Добави индекс",
+      "foreignKey": "Добави външен ключ",
+      "check": "Добави проверка"
+    },
+    "revert": "Отмени",
+    "apply": "Приложи",
+    "toAdd": "{{count}} за добавяне",
+    "toChange": "{{count}} за промяна",
+    "toDrop": "{{count}} за изтриване",
+    "preview": "SQL преглед",
+    "statements_one": "{{count}} израз",
+    "statements_other": "{{count}} израза",
+    "oneTransaction": "една транзакция",
+    "primaryKey": "Ключ",
+    "drop": "Изтрий",
+    "restore": "Възстанови",
+    "problem": {
+      "emptyTableName": "Въведете име на таблицата",
+      "emptyName": "Въведете име",
+      "duplicateName": "Това име вече е заето",
+      "emptyType": "Изберете тип",
+      "noColumns": "Таблицата трябва да има поне една колона",
+      "noIndexColumns": "Изберете колоните за индекса",
+      "usesDroppedColumn": "Използва {{column}}, която се изтрива",
+      "foreignKeyColumnCount": "Посочете толкова колони, колкото сочи",
+      "noReferencedTable": "Изберете таблицата, към която сочи",
+      "emptyExpression": "Въведете условието",
+      "unsupported": "Тази база данни не може да направи тази промяна"
+    },
+    "columns": "Колони",
+    "indexes": "Индекси",
+    "foreignKeys": "Външни ключове",
+    "checks": "Проверки",
+    "loadFailed": "Структурата на таблицата не можа да се зареди",
+    "retry": "Опитай отново",
+    "name": "Име",
+    "type": "Тип",
+    "nullable": "Допуска NULL",
+    "default": "Стойност по подразбиране",
+    "comment": "Коментар",
+    "generated": "Генерирана:",
+    "problemRow": "Ред {{row}}: {{problem}}",
+    "problems_one": "{{count}} проблем",
+    "problems_other": "{{count}} проблема",
+    "identity": {
+      "label": "Идентичност",
+      "none": "Без",
+      "byDefault": "Идентичност, по подразбиране",
+      "always": "Идентичност, винаги",
+      "autoIncrement": "Автоинкремент",
+      "seeded": "Идентичност ({{seed}}, {{increment}})"
+    }
   }
 }

@@ -44,6 +44,7 @@ pub enum TableTabEvent {
     FocusedRowChanged,
     // Foreign-key jump to the referenced table, filtered to the row.
     OpenTable { schema: String, table: String, filter: String },
+    OpenStructure,
 }
 
 pub struct TableTab {
@@ -319,7 +320,10 @@ impl TableTab {
                     .iter()
                     .filter(|c| !c.enum_values.is_empty())
                     .map(|c| {
-                        (c.name.clone(), Choices { values: c.enum_values.clone().into(), nullable: c.is_nullable })
+                        (
+                            c.name.clone(),
+                            Choices { values: c.enum_values.clone().into(), nullable: c.is_nullable, open: false },
+                        )
                     })
                     .collect();
                 this.sync_overlay(cx);
@@ -463,6 +467,7 @@ impl TableTab {
             primary,
             choices,
             editable: self.editable(),
+            ..Default::default()
         };
         self.grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
         cx.notify();
@@ -804,6 +809,15 @@ impl TableTab {
             .child(
                 h_flex()
                     .gap(rems(0.462))
+                    .when(!schema::is_view(&self.connection.id, &self.schema, &self.table, cx), |el| {
+                        el.child(
+                            Button::new("table-structure")
+                                .debug_selector(|| "table-structure".into())
+                                .tool_icon(Icon::new(Lucide::Columns3), ICON_SM)
+                                .tooltip(t(cx, "tableView.structure"))
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(TableTabEvent::OpenStructure))),
+                        )
+                    })
                     .child(
                         Button::new("table-refresh")
                             .debug_selector(|| "table-refresh".into())

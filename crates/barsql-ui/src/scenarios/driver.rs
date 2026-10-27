@@ -142,6 +142,14 @@ impl Driver<'_> {
         self.cx.debug_bounds(selector)
     }
 
+    // Waits for an element that a load draws, like a tab's rows.
+    pub fn wait_shown(&mut self, selector: &'static str) {
+        settle(self.cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(selector).is_some()
+        });
+    }
+
     pub fn shown(&mut self, selector: &'static str) -> bool {
         self.bounds(selector).is_some()
     }
@@ -277,6 +285,10 @@ impl Driver<'_> {
 
     pub fn tab(&mut self) -> Entity<QueryTab> {
         self.cx.update(|_, cx| self.workspace.read(cx).query_tab()).expect("a query tab is active")
+    }
+
+    pub fn structure(&mut self) -> Entity<crate::structure_tab::StructureTab> {
+        self.cx.update(|_, cx| self.workspace.read(cx).active_structure()).expect("a Structure tab is active")
     }
 
     pub fn titles(&mut self) -> Vec<String> {

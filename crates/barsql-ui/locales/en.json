@@ -143,6 +143,9 @@
     "planHideQuiet": "Hide 0 and false"
   },
   "sidebar": {
+    "newTable": "New table…",
+    "editStructure": "Edit structure…",
+    "viewStructure": "View structure",
     "badge": {
       "matview": "MATVIEW"
     },
@@ -224,6 +227,7 @@
     "showAllColumns": "Show all columns"
   },
   "tableView": {
+    "structure": "Structure",
     "markRows": "Mark {{count}} row for delete",
     "markRows_other": "Mark {{count}} rows for delete",
     "unmarkRows": "Unmark {{count}} row for delete",
@@ -279,6 +283,8 @@
     "exportStopped_other": "Export stopped - {{fileName}} holds only the first {{count}} rows"
   },
   "menu": {
+    "editTableStructure": "Edit table structure",
+    "newTable": "New table",
     "toggleSidebar": "Sidebar",
     "toggleJsonPanel": "JSON viewer",
     "undo": "Undo",
@@ -445,5 +451,103 @@
     "license": "{{name}} license",
     "madeWith": "Made with",
     "checkUpdates": "Check for updates"
+  },
+  "structure": {
+    "foreignKey": {
+      "name": "Name",
+      "columns": "Columns",
+      "table": "References",
+      "refColumns": "Referenced columns",
+      "onUpdate": "On update",
+      "onDelete": "On delete"
+    },
+    "action": {
+      "noAction": "No action",
+      "restrict": "Restrict",
+      "cascade": "Cascade",
+      "setNull": "Set null",
+      "setDefault": "Set default"
+    },
+    "check": {
+      "name": "Name",
+      "expression": "Condition"
+    },
+    "index": {
+      "name": "Name",
+      "columns": "Columns",
+      "unique": "Unique",
+      "method": "Method",
+      "definition": "Definition",
+      "constraint": "Constraint"
+    },
+    "discardTitle": "Discard structure changes?",
+    "discardDescription_one": "One tab has structure changes that weren't applied. They're lost when it closes.",
+    "discardDescription_other": "{{count}} tabs have structure changes that weren't applied. They're lost when they close.",
+    "discardConfirm": "Discard changes",
+    "newTableTitle": "New table",
+    "tableName": "Table name",
+    "tableNamePlaceholder": "e.g. customers",
+    "applyTitle": "Apply structure changes",
+    "applyConfirm": "Apply",
+    "applied": "Changed the structure of {{name}}",
+    "rebuildWarning": "SQLite can't change this in place, so the table is rebuilt and its rows copied over.",
+    "notAtomicWarning": "This database can't undo schema changes: if a statement fails, the ones before it stay.",
+    "gone": "This table no longer exists.",
+    "stale": "The table was changed elsewhere. Reload to see it, which drops your changes here.",
+    "reload": "Reload",
+    "addRow": {
+      "column": "Add column",
+      "index": "Add index",
+      "foreignKey": "Add foreign key",
+      "check": "Add check"
+    },
+    "revert": "Revert",
+    "apply": "Apply",
+    "toAdd": "{{count}} to add",
+    "toChange": "{{count}} to change",
+    "toDrop": "{{count}} to drop",
+    "preview": "SQL preview",
+    "statements_one": "{{count}} statement",
+    "statements_other": "{{count}} statements",
+    "oneTransaction": "one transaction",
+    "primaryKey": "Key",
+    "drop": "Drop",
+    "restore": "Restore",
+    "problem": {
+      "emptyTableName": "Name the table",
+      "emptyName": "Give it a name",
+      "duplicateName": "Another one already has this name",
+      "emptyType": "Pick a type",
+      "noColumns": "A table needs at least one column",
+      "noIndexColumns": "Pick the columns to index",
+      "usesDroppedColumn": "Uses {{column}}, which is being dropped",
+      "foreignKeyColumnCount": "Name as many columns as it references",
+      "noReferencedTable": "Pick the table it references",
+      "emptyExpression": "Write the condition",
+      "unsupported": "This database can't make this change"
+    },
+    "columns": "Columns",
+    "indexes": "Indexes",
+    "foreignKeys": "Foreign keys",
+    "checks": "Checks",
+    "loadFailed": "Couldn't load the table's structure",
+    "retry": "Try Again",
+    "name": "Name",
+    "type": "Type",
+    "nullable": "Nullable",
+    "default": "Default",
+    "comment": "Comment",
+    "generated": "Generated:",
+    "problemRow": "Row {{row}}: {{problem}}",
+    "problems_one": "{{count}} problem",
+    "problems_other": "{{count}} problems",
+    "identity": {
+      "label": "Identity",
+      "none": "None",
+      "byDefault": "Identity, by default",
+      "always": "Identity, always",
+      "autoIncrement": "Auto-increment",
+      "seeded": "Identity ({{seed}}, {{increment}})"
+    }
   }
 }

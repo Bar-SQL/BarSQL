@@ -35,6 +35,8 @@ pub enum SidebarEvent {
     OpenQuery { connection: ConnectionConfig, sql: String, title: String, run: bool },
     Browse { connection: ConnectionConfig, schema: String, table: String },
     OpenDiagram { connection: ConnectionConfig, schema: String },
+    // No `table` for a new one.
+    OpenStructure { connection: ConnectionConfig, schema: String, table: Option<String> },
     // SQL from history. Goes into the connection's plain query tab.
     OpenSql { connection: ConnectionConfig, sql: String },
     OpenSaved(SavedQuery),
@@ -88,6 +90,10 @@ impl Sidebar {
                     SchemaTreeEvent::OpenDiagram { schema } => {
                         let Some(connection) = this.selected().cloned() else { return };
                         SidebarEvent::OpenDiagram { connection, schema: schema.clone() }
+                    }
+                    SchemaTreeEvent::OpenStructure { schema, table } => {
+                        let Some(connection) = this.selected().cloned() else { return };
+                        SidebarEvent::OpenStructure { connection, schema: schema.clone(), table: table.clone() }
                     }
                     SchemaTreeEvent::OpenScript { connection, sql, title } => SidebarEvent::OpenQuery {
                         connection: (**connection).clone(),
@@ -425,8 +431,13 @@ impl Sidebar {
             ("sidebar.saved", Lucide::Bookmark),
             ("sidebar.recent", Lucide::Clock),
         ];
-        h_flex().flex_none().h(rems(3.077)).border_b_1().border_color(theme.border).children(
-            tabs.into_iter().enumerate().map(|(ix, (key, icon))| {
+        h_flex()
+            .debug_selector(|| "sidebar-tabs".into())
+            .flex_none()
+            .h(rems(3.077))
+            .border_b_1()
+            .border_color(theme.border)
+            .children(tabs.into_iter().enumerate().map(|(ix, (key, icon))| {
                 let active = PANELS[ix] == self.panel;
                 h_flex()
                     .id(key)
@@ -453,8 +464,7 @@ impl Sidebar {
                         this.panel = PANELS[ix];
                         cx.notify();
                     }))
-            }),
-        )
+            }))
     }
 
     fn empty(&self, message: SharedString, cx: &App) -> impl IntoElement {

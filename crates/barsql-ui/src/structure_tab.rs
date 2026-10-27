@@ -1,0 +1,978 @@
+mod checks;
+mod columns;
+mod foreign_keys;
+mod indexes;
+mod preview;
+mod sheet;
+#[cfg(test)]
+mod tests;
+
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use barsql_app::{EditorTab, StructureRef};
+use barsql_core::{Check, ConnectionConfig, ForeignKey, StructColumn, StructIndex, TableStructure};
+use barsql_sql::structure::{
+    ChangePlan, ColumnRow, Draft, Problem, ProblemKind, Row, Section, changes, plan_changes, plan_create,
+};
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{EditorState, InputEvent, InputState};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use self::preview::PreviewDrag;
+use self::sheet::Sheet;
+use crate::cell_viewer;
+use crate::connections_panel::parse_color;
+use crate::form::{self, ToolButton as _};
+use crate::grid::{Grid, GridEvent};
+use crate::i18n::{I18n, t, t_count, t_with};
+use crate::schema;
+use crate::schema_actions;
+use crate::schema_tree::TableChange;
+use crate::state;
+use crate::toast;
+use crate::tokens::{ICON_MD, ICON_SM, TEXT_MD, TEXT_SM};
+
+const CONTEXT: &str = "StructureTab";
+
+actions!(structure_tab, [ApplyStructure]);
+
+#[cfg(target_os = "macos")]
+const MOD: &str = "cmd";
+#[cfg(not(target_os = "macos"))]
+const MOD: &str = "ctrl";
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(&format!("{MOD}-s"), ApplyStructure, Some(CONTEXT))]);
+}
+
+pub enum StructureTabEvent {
+    Edited,
+    Applied { created: Option<String> },
+}
+
+enum Load {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+const SECTIONS: [(Section, &str); 4] = [
+    (Section::Columns, "structure.columns"),
+    (Section::Indexes, "structure.indexes"),
+    (Section::ForeignKeys, "structure.foreignKeys"),
+    (Section::Checks, "structure.checks"),
+];
+
+fn slot(section: Section) -> usize {
+    match section {
+        Section::Columns | Section::Table => 0,
+        Section::Indexes => 1,
+        Section::ForeignKeys => 2,
+        Section::Checks => 3,
+    }
+}
+
+#[derive(Default)]
+struct History {
+    past: Vec<Draft>,
+    future: Vec<Draft>,
+}
+
+// A table's columns, keys, indexes and checks in a tab of its own. An empty `table` is a new table, not yet created.
+pub struct StructureTab {
+    pub id: String,
+    pub connection: ConnectionConfig,
+    pub schema: String,
+    pub table: String,
+    focus: FocusHandle,
+    load: Load,
+    original: Option<TableStructure>,
+    pub(crate) draft: Draft,
+    plan: Result<ChangePlan, Vec<Problem>>,
+    history: History,
+    // One per section, in SECTIONS' order.
+    sheets: [Sheet; 4],
+    preview: Entity<EditorState>,
+    script: String,
+    preview_open: bool,
+    section: Section,
+    problems_scroll: ScrollHandle,
+    // The table was dropped, or changed elsewhere, while this tab held changes.
+    gone: bool,
+    stale: bool,
+    // Only a new table has one.
+    name_field: Option<Entity<InputState>>,
+    _load: Task<()>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<StructureTabEvent> for StructureTab {}
+
+impl StructureTab {
+    pub fn new(tab: EditorTab, connection: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let target = tab.structure.unwrap_or_default();
+        let draft = Draft::new_table(&connection.driver, &target.schema);
+        let load = if target.table.is_empty() { Load::Ready } else { Load::Loading };
+        let preview = cx.new(|cx| EditorState::new(window, cx).language("sql").line_number(false));
+        let name_field = target
+            .table
+            .is_empty()
+            .then(|| cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "structure.tableNamePlaceholder"))));
+        let mut subscriptions: Vec<Subscription> = name_field
+            .iter()
+            .map(|field| {
+                cx.subscribe_in(field, window, |tab: &mut Self, state, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        tab.draft.name = state.read(cx).value().trim().to_string();
+                        tab.changed(window, cx);
+                    }
+                })
+            })
+            .collect();
+        let sheets = [(); 4].map(|_| Sheet::new(cx));
+        for (sheet, (section, _)) in sheets.iter().zip(SECTIONS) {
+            subscriptions.push(cx.subscribe_in(&sheet.grid, window, move |tab: &mut Self, grid, event, window, cx| {
+                tab.grid_event(section, grid, event, window, cx)
+            }));
+            subscriptions.push(cx.observe(&sheet.grid, |_, _, cx| cx.notify()));
+        }
+        // The pickers list what the schema holds, as it loads, in the language it's shown in.
+        subscriptions.push(cx.observe_global::<schema::Schemas>(|tab, cx| tab.sync(cx)));
+        subscriptions.push(cx.observe_global::<I18n>(|tab, cx| tab.sync(cx)));
+        let mut this = Self {
+            id: tab.id,
+            connection,
+            schema: target.schema,
+            table: target.table,
+            focus: cx.focus_handle(),
+            load,
+            original: None,
+            draft,
+            plan: Ok(ChangePlan::default()),
+            history: History::default(),
+            sheets,
+            preview,
+            script: String::new(),
+            preview_open: true,
+            section: Section::Columns,
+            problems_scroll: ScrollHandle::new(),
+            gone: false,
+            stale: false,
+            name_field,
+            _load: Task::ready(()),
+            _subscriptions: subscriptions,
+        };
+        if this.table.is_empty() {
+            this.replan(window, cx);
+        }
+        this
+    }
+
+    pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.table.is_empty() {
+            return;
+        }
+        self.load = Load::Loading;
+        self.stale = false;
+        let bar = state::bar(cx);
+        let (id, schema, table) = (self.connection.id.clone(), self.schema.clone(), self.table.clone());
+        let loaded = state::spawn(cx, async move { bar.table_structure(&id, &schema, &table).await });
+        self._load = cx.spawn_in(window, async move |this, cx| {
+            let result = loaded.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Some(Ok(structure)) => {
+                        this.draft = Draft::from_structure(&structure);
+                        this.original = Some(structure);
+                        this.load = Load::Ready;
+                        this.history = History::default();
+                        this.load_targets(cx);
+                        this.replan(window, cx);
+                    }
+                    Some(Err(error)) => this.load = Load::Failed(error.message),
+                    None => {}
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    pub fn title(&self, cx: &App) -> SharedString {
+        if self.table.is_empty() { t(cx, "structure.newTableTitle") } else { self.table.clone().into() }
+    }
+
+    fn naming(&self) -> Option<&Entity<InputState>> {
+        self.name_field.as_ref().filter(|_| self.table.is_empty())
+    }
+
+    pub fn persisted(&self) -> bool {
+        !self.table.is_empty()
+    }
+
+    pub fn stored(&self, cx: &App) -> EditorTab {
+        let structure = StructureRef { schema: self.schema.clone(), table: self.table.clone() };
+        EditorTab {
+            id: self.id.clone(),
+            connection_id: self.connection.id.clone(),
+            title: self.title(cx).to_string(),
+            color: self.connection.color.clone(),
+            structure: self.persisted().then_some(structure),
+            ..Default::default()
+        }
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        match self.naming() {
+            Some(field) => field.update(cx, |state, cx| state.focus(window, cx)),
+            None => {
+                let grid = self.sheet(self.section).grid.read(cx).focus_handle(cx);
+                window.focus(&grid, cx);
+            }
+        }
+    }
+
+    pub fn set_connection(&mut self, connection: ConnectionConfig, cx: &mut Context<Self>) {
+        self.connection = connection;
+        self.sync(cx);
+        cx.notify();
+    }
+
+    pub fn has_changes(&self) -> bool {
+        match &self.original {
+            Some(original) => !changes(original, &self.draft).is_empty(),
+            None => self.table.is_empty() && self.draft != Draft::new_table(&self.connection.driver, &self.schema),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn script(&self) -> &str {
+        &self.script
+    }
+
+    #[cfg(test)]
+    pub fn tally_counts(&self) -> (usize, usize, usize) {
+        self.total()
+    }
+
+    #[cfg(test)]
+    pub fn section_count(&self, section: Section) -> usize {
+        self.count(section)
+    }
+
+    #[cfg(test)]
+    pub fn grid(&self) -> Entity<Grid> {
+        self.sheet(self.section).grid.clone()
+    }
+
+    // Read-only connections get a viewer, and nothing is editable until the structure has loaded.
+    pub(crate) fn editable(&self) -> bool {
+        !self.connection.read_only
+            && self.connection.driver.capabilities().structure.editable
+            && matches!(self.load, Load::Ready)
+    }
+
+    fn section_editable(&self, section: Section) -> bool {
+        let editing = &self.connection.driver.capabilities().structure;
+        self.editable()
+            && match section {
+                Section::Columns | Section::Table => true,
+                Section::Indexes => editing.indexes,
+                Section::ForeignKeys => editing.foreign_keys,
+                Section::Checks => editing.checks,
+            }
+    }
+
+    pub fn can_apply(&self) -> bool {
+        !self.gone && self.editable() && self.plan.as_ref().is_ok_and(|plan| !plan.is_empty())
+    }
+
+    pub fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan) = self.plan.as_ref().ok().filter(|_| self.can_apply()).cloned() else { return };
+        let this = cx.entity().downgrade();
+        schema_actions::open_structure_apply(self.connection.clone(), plan, window, cx, move |cx| {
+            let _ = this.update(cx, |tab, cx| {
+                let created = tab.table.is_empty().then(|| tab.draft.name.clone());
+                let name = created.clone().unwrap_or_else(|| tab.table.clone());
+                toast::success(t_with(cx, "structure.applied", &[("name", &name)]), cx);
+                cx.emit(StructureTabEvent::Applied { created });
+            });
+        });
+    }
+
+    pub fn after_apply(&mut self, created: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = created {
+            self.table = name;
+        }
+        // Until the reload lands, the old structure would make the applied draft look pending.
+        self.original = None;
+        self.load(window, cx);
+        cx.notify();
+    }
+
+    // A dropped table's tab is closed by the workspace when it holds no changes.
+    pub fn table_changed(&mut self, change: &TableChange, window: &mut Window, cx: &mut Context<Self>) {
+        match change {
+            TableChange::Renamed(name) => {
+                self.table = name.clone();
+                self.draft.name = name.clone();
+                if let Some(original) = &mut self.original {
+                    original.name = name.clone();
+                }
+                self.replan(window, cx);
+                cx.emit(StructureTabEvent::Edited);
+            }
+            TableChange::Dropped => self.gone = true,
+            TableChange::Altered if matches!(self.load, Load::Loading) => {}
+            TableChange::Altered if self.has_changes() => self.stale = true,
+            TableChange::Altered => self.load(window, cx),
+        }
+        cx.notify();
+    }
+
+    fn sheet(&self, section: Section) -> &Sheet {
+        &self.sheets[slot(section)]
+    }
+
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.load, Load::Ready) {
+            return;
+        }
+        let shapes = [
+            columns::shape(self, cx),
+            indexes::shape(self, cx),
+            foreign_keys::shape(self, cx),
+            checks::shape(self, cx),
+        ];
+        let editable = SECTIONS.map(|(section, _)| self.section_editable(section));
+        let outlined = SECTIONS.map(|(section, _)| self.outlined(section));
+        for (((sheet, mut shape), editable), invalid) in self.sheets.iter_mut().zip(shapes).zip(editable).zip(outlined)
+        {
+            shape.invalid = invalid;
+            sheet.show(shape, editable, cx);
+        }
+    }
+
+    fn replan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let driver = &self.connection.driver;
+        self.plan = match &self.original {
+            Some(original) => plan_changes(driver, original, &self.draft),
+            None => plan_create(driver, &self.draft),
+        };
+        let script = self.plan.as_ref().map(|plan| plan.preview(driver)).unwrap_or_default();
+        // Setting the editor's text re-shapes it, so only a changed script goes in.
+        if script != self.script {
+            self.preview.update(cx, |state, cx| state.set_value(script.clone(), window, cx));
+            self.script = script;
+        }
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replan(window, cx);
+        cx.emit(StructureTabEvent::Edited);
+    }
+
+    fn record(&mut self, before: Draft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft != before {
+            self.history.past.push(before);
+            self.history.future.clear();
+            self.changed(window, cx);
+        }
+    }
+
+    // A new table's name stays as its field has it.
+    fn travel(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let History { past, future } = &mut self.history;
+        let (from, to) = if back { (past, future) } else { (future, past) };
+        let Some(mut draft) = from.pop() else { return };
+        draft.name = self.draft.name.clone();
+        to.push(std::mem::replace(&mut self.draft, draft));
+        self.changed(window, cx);
+    }
+
+    fn grid_event(
+        &mut self,
+        section: Section,
+        grid: &Entity<Grid>,
+        event: &GridEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editable = self.section_editable(section);
+        match event {
+            GridEvent::EditCell { row, column, value } if editable => {
+                self.edit_cells(section, &[(*row, *column, value.clone())], window, cx)
+            }
+            GridEvent::PasteCells(cells) if editable => self.edit_cells(section, cells, window, cx),
+            GridEvent::ToggleDelete(row) if editable => self.drop_rows(section, &[*row], window, cx),
+            GridEvent::DeleteRows(rows) if editable => self.drop_rows(section, rows, window, cx),
+            GridEvent::Undo if editable => self.travel(true, window, cx),
+            GridEvent::Redo if editable => self.travel(false, window, cx),
+            GridEvent::Apply => self.apply(window, cx),
+            GridEvent::Refresh if !self.has_changes() => self.load(window, cx),
+            GridEvent::ViewCell { row, column } => {
+                let (name, value) = shown(grid, *row, *column, cx);
+                cell_viewer::open(name, String::new(), value, window, cx);
+            }
+            GridEvent::EditInViewer { row, column } if editable => {
+                let (name, value) = shown(grid, *row, *column, cx);
+                let (grid, row, column) = (grid.downgrade(), *row, *column);
+                let on_save: cell_viewer::OnSave = Rc::new(move |value, _, cx| {
+                    grid.update(cx, |_, cx| cx.emit(GridEvent::EditCell { row, column, value })).ok();
+                });
+                cell_viewer::open_editor(name, String::new(), value, on_save, window, cx);
+            }
+            GridEvent::Export => crate::export_dialog::open(grid.read(cx).export_source(), window, cx),
+            _ => {}
+        }
+    }
+
+    fn edit_cells(
+        &mut self,
+        section: Section,
+        cells: &[(usize, usize, Option<String>)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.draft.clone();
+        for (row, column, value) in cells.iter().cloned() {
+            match section {
+                Section::Columns | Section::Table => columns::edit(self, row, column, value, cx),
+                Section::Indexes => indexes::edit(self, row, column, value),
+                Section::ForeignKeys => foreign_keys::edit(self, row, column, value, window, cx),
+                Section::Checks => checks::edit(self, row, column, value),
+            }
+        }
+        self.record(before, window, cx);
+    }
+
+    // A generated column isn't dropped here.
+    fn drop_rows(&mut self, section: Section, rows: &[usize], window: &mut Window, cx: &mut Context<Self>) {
+        let before = self.draft.clone();
+        let draft = &mut self.draft;
+        match section {
+            Section::Columns | Section::Table => {
+                let columns = &draft.columns;
+                let rows: Vec<usize> = rows
+                    .iter()
+                    .copied()
+                    .filter(|&row| columns.get(row).is_some_and(|line| line.column.generated.is_empty()))
+                    .collect();
+                toggle_dropped(&mut draft.columns, &rows);
+            }
+            Section::Indexes => toggle_dropped(&mut draft.indexes, rows),
+            Section::ForeignKeys => toggle_dropped(&mut draft.foreign_keys, rows),
+            Section::Checks => toggle_dropped(&mut draft.checks, rows),
+        }
+        self.record(before, window, cx);
+    }
+
+    // The shown section's focused row, if any, and whether it's dropped.
+    fn focused_row(&self, cx: &App) -> Option<(usize, bool)> {
+        let grid = self.sheet(self.section).grid.read(cx);
+        let (row, _) = grid.focused_cell().filter(|&(row, _)| row < grid.set().rows())?;
+        Some((row, grid.is_deleted(row)))
+    }
+
+    fn drop_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((row, _)) = self.focused_row(cx) {
+            self.drop_rows(self.section, &[row], window, cx);
+        }
+    }
+
+    // The new row opens for typing at its name, or at what names it: a key's or index's columns, a check's condition.
+    fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let section = self.section;
+        if !self.section_editable(section) {
+            return;
+        }
+        let before = self.draft.clone();
+        let draft = &mut self.draft;
+        let (row, column) = match section {
+            Section::Columns | Section::Table => {
+                let column = StructColumn { nullable: true, ..Default::default() };
+                draft.columns.push(ColumnRow { origin: None, dropped: false, column, primary: false });
+                (draft.columns.len() - 1, 0)
+            }
+            Section::Indexes => {
+                draft.indexes.push(Row::added(StructIndex::default()));
+                (draft.indexes.len() - 1, 1)
+            }
+            Section::ForeignKeys => {
+                draft.foreign_keys.push(Row::added(ForeignKey::default()));
+                (draft.foreign_keys.len() - 1, 1)
+            }
+            Section::Checks => {
+                draft.checks.push(Row::added(Check::default()));
+                (draft.checks.len() - 1, 1)
+            }
+        };
+        self.record(before, window, cx);
+        let grid = self.sheet(section).grid.clone();
+        grid.update(cx, |grid, cx| grid.edit_cell(row, column, window, cx));
+    }
+
+    pub fn revert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let before = self.draft.clone();
+        self.draft = match &self.original {
+            Some(original) => Draft::from_structure(original),
+            None => Draft::new_table(&self.connection.driver, &self.schema),
+        };
+        if let Some(field) = self.naming() {
+            field.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.record(before, window, cx);
+    }
+
+    fn problem_columns(&self, problem: &Problem) -> Vec<usize> {
+        match problem.section {
+            Section::Table => Vec::new(),
+            Section::Columns => columns::problem_columns(self, &problem.kind),
+            Section::Indexes => indexes::problem_columns(self, &problem.kind),
+            Section::ForeignKeys => foreign_keys::problem_columns(self, &problem.kind),
+            Section::Checks => checks::problem_columns(&problem.kind),
+        }
+    }
+
+    fn outlined(&self, section: Section) -> HashSet<(usize, usize)> {
+        let problems = self.plan.as_ref().err().map(Vec::as_slice).unwrap_or_default();
+        let here = problems.iter().filter(|problem| problem.section == section);
+        here.flat_map(|problem| self.problem_columns(problem).into_iter().map(|column| (problem.row, column))).collect()
+    }
+
+    fn problem_lines(&self, cx: &App) -> Vec<(Problem, SharedString)> {
+        let problems = self.plan.as_ref().err().map(Vec::as_slice).unwrap_or_default();
+        let line = |problem: &Problem| {
+            let text = problem_text(&problem.kind, cx);
+            let Some((_, key)) = SECTIONS.iter().find(|(section, _)| *section == problem.section) else { return text };
+            let row = (problem.row + 1).to_string();
+            let at = t_with(cx, "structure.problemRow", &[("row", &row), ("problem", &text)]);
+            format!("{} \u{b7} {at}", t(cx, key)).into()
+        };
+        problems.iter().map(|problem| (problem.clone(), line(problem))).collect()
+    }
+
+    // A problem's cell, focused in its section, or the new table's name.
+    fn show_problem(&mut self, problem: &Problem, window: &mut Window, cx: &mut Context<Self>) {
+        if problem.section == Section::Table {
+            if let Some(field) = self.naming() {
+                field.update(cx, |state, cx| state.focus(window, cx));
+            }
+            return;
+        }
+        let column = self.problem_columns(problem).first().copied().unwrap_or(0);
+        self.section = problem.section;
+        let grid = self.sheet(problem.section).grid.clone();
+        grid.update(cx, |grid, cx| grid.focus_cell(problem.row, column, window, cx));
+        cx.notify();
+    }
+
+    // The rows the draft adds, changes and drops, by section in SECTIONS' order. A new table adds all of its rows.
+    fn tally(&self) -> [(usize, usize, usize); 4] {
+        let (draft, original) = (&self.draft, self.original.as_ref());
+        let keys = original.and_then(|original| original.primary_key.as_ref()).map_or(&[][..], |key| &key.columns[..]);
+        // Indexes and keys take a renamed column's new name, which alone changes only the column.
+        let renamed: HashMap<&str, &str> = draft
+            .columns
+            .iter()
+            .filter_map(|row| Some((original?.columns.get(row.origin?)?.name.as_str(), row.column.name.as_str())))
+            .collect();
+        let follow = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| renamed.get(name.as_str()).map_or_else(|| name.clone(), |new| new.to_string()))
+                .collect()
+        };
+        let count = |tally: &mut (usize, usize, usize), origin: Option<usize>, dropped: bool, changed: bool| match (
+            origin, dropped,
+        ) {
+            (None, _) => tally.0 += 1,
+            (Some(_), true) => tally.2 += 1,
+            (Some(_), false) => tally.1 += usize::from(changed),
+        };
+        let mut tallies = [(0, 0, 0); 4];
+        for row in &draft.columns {
+            let old = row.origin.and_then(|ix| original?.columns.get(ix));
+            let changed = old.is_some_and(|old| *old != row.column || keys.contains(&old.name) != row.primary);
+            count(&mut tallies[0], row.origin, row.dropped, changed);
+        }
+        for row in &draft.indexes {
+            let old = row.origin.and_then(|ix| original?.indexes.get(ix));
+            let changed =
+                old.is_some_and(|old| StructIndex { columns: follow(&old.columns), ..old.clone() } != row.value);
+            count(&mut tallies[1], row.origin, row.dropped, changed);
+        }
+        for row in &draft.foreign_keys {
+            let old = row.origin.and_then(|ix| original?.foreign_keys.get(ix));
+            let changed =
+                old.is_some_and(|old| ForeignKey { columns: follow(&old.columns), ..old.clone() } != row.value);
+            count(&mut tallies[2], row.origin, row.dropped, changed);
+        }
+        for row in &draft.checks {
+            let old = row.origin.and_then(|ix| original?.checks.get(ix));
+            count(&mut tallies[3], row.origin, row.dropped, old.is_some_and(|old| *old != row.value));
+        }
+        tallies
+    }
+
+    fn total(&self) -> (usize, usize, usize) {
+        self.tally().iter().fold((0, 0, 0), |sum, tally| (sum.0 + tally.0, sum.1 + tally.1, sum.2 + tally.2))
+    }
+
+    fn count(&self, section: Section) -> usize {
+        let draft = &self.draft;
+        match section {
+            Section::Columns | Section::Table => draft.columns.len(),
+            Section::Indexes => draft.indexes.len(),
+            Section::ForeignKeys => draft.foreign_keys.len(),
+            Section::Checks => draft.checks.len(),
+        }
+    }
+
+    // Engines without checks or foreign keys don't get those sections.
+    fn shows(&self, section: Section) -> bool {
+        let editing = &self.connection.driver.capabilities().structure;
+        match section {
+            Section::ForeignKeys => editing.foreign_keys,
+            Section::Checks => editing.checks,
+            Section::Columns | Section::Table | Section::Indexes => true,
+        }
+    }
+
+    fn header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let tallies = self.tally();
+        let switch = SECTIONS.iter().enumerate().fold(form::toggle_group(), |group, (ix, (section, key))| {
+            let section = *section;
+            if !self.shows(section) {
+                return group;
+            }
+            let label = format!("{} {}", t(cx, key), self.count(section));
+            let dot = (tallies[slot(section)] != (0, 0, 0)).then(|| {
+                div()
+                    .size(rems(0.462))
+                    .ml(rems(0.308))
+                    .rounded_full()
+                    .bg(theme.warning)
+                    .debug_selector(move || format!("structure:section-dot:{ix}"))
+            });
+            group.child(
+                form::toggle(("structure-section", ix), label, self.section == section)
+                    .debug_selector(move || format!("structure-section:{ix}"))
+                    .children(dot)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.section = section;
+                        let grid = this.sheet(section).grid.read(cx).focus_handle(cx);
+                        window.focus(&grid, cx);
+                        cx.notify();
+                    })),
+            )
+        });
+        let color = parse_color(&self.connection.color).unwrap_or(theme.muted_foreground);
+        let icon = div()
+            .flex_none()
+            .debug_selector(|| "structure-title-icon".into())
+            .child(Icon::new(Lucide::Columns3).size(ICON_MD).text_color(color));
+        h_flex()
+            .debug_selector(|| "structure-header".into())
+            .flex_none()
+            .justify_between()
+            .gap(rems(0.923))
+            .px(rems(1.231))
+            .h(rems(3.077))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(match self.naming() {
+                Some(field) => h_flex()
+                    .gap(rems(0.462))
+                    .text_size(TEXT_SM)
+                    .child(icon)
+                    .child(div().text_color(theme.muted_foreground).child(t(cx, "structure.tableName")))
+                    .child(format!("{}.", self.schema))
+                    .child(
+                        div()
+                            .w(rems(16.))
+                            .debug_selector(|| "structure:table-name".into())
+                            .child(form::input(field, window, cx).disabled(!self.editable())),
+                    )
+                    .into_any_element(),
+                None => h_flex()
+                    .min_w_0()
+                    .gap(rems(0.615))
+                    .child(icon)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(TEXT_MD)
+                            .font_semibold()
+                            .debug_selector(|| "structure-title".into())
+                            .child(self.table.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(TEXT_SM)
+                            .text_color(theme.muted_foreground)
+                            .debug_selector(|| "structure-title-schema".into())
+                            .child(self.schema.clone()),
+                    )
+                    .into_any_element(),
+            })
+            .child(div().w(rems(30.769)).child(switch))
+    }
+
+    fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let theme = cx.theme().clone();
+        if self.gone {
+            let text = t(cx, "structure.gone");
+            return Some(
+                form::error(text, cx).mx(rems(1.231)).mt(rems(0.615)).debug_selector(|| "structure-gone".into()),
+            );
+        }
+        self.stale.then(|| {
+            form::alert(theme.warning)
+                .mx(rems(1.231))
+                .mt(rems(0.615))
+                .debug_selector(|| "structure-stale".into())
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .gap(rems(0.923))
+                        .child(div().flex_1().min_w_0().child(t(cx, "structure.stale")))
+                        .child(
+                            Button::new("structure-reload")
+                                .small()
+                                .debug_selector(|| "structure-reload".into())
+                                .label(t(cx, "structure.reload"))
+                                .on_click(cx.listener(|this, _, window, cx| this.load(window, cx))),
+                        ),
+                )
+        })
+    }
+
+    fn body(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let waiting = div().flex_1().min_h_0();
+        match &self.load {
+            Load::Loading => {
+                waiting.child(form::empty_state(None, t(cx, "tableView.loading"), cx).m_auto()).into_any_element()
+            }
+            Load::Failed(error) => waiting
+                .child(
+                    v_flex()
+                        .m_auto()
+                        .gap(rems(0.615))
+                        .items_center()
+                        .child(form::error(format!("{}\n{error}", t(cx, "structure.loadFailed")), cx))
+                        .child(
+                            Button::new("structure-retry")
+                                .small()
+                                .debug_selector(|| "structure-retry".into())
+                                .label(t(cx, "structure.retry"))
+                                .on_click(cx.listener(|this, _, window, cx| this.load(window, cx))),
+                        ),
+                )
+                .into_any_element(),
+            Load::Ready => {
+                let grid = self.sheet(self.section).grid.clone();
+                let rows = div().min_h_0().debug_selector(|| "structure-body".into());
+                // The rows take the height they need, and the preview under them the rest.
+                let rows = match self.editable() {
+                    true => rows.flex_shrink(1.).h(grid.read(cx).fit_height(window)),
+                    false => rows.flex_1(),
+                };
+                rows.child(grid).into_any_element()
+            }
+        }
+    }
+
+    fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let (added, changed, dropped) = self.total();
+        let problems = self.plan.as_ref().err().map(Vec::as_slice).unwrap_or_default();
+        let rows = self.section_editable(self.section);
+        let focused = self.focused_row(cx);
+        let pill = |key: &str, count: usize, color: Hsla, selector: &'static str| {
+            let text = t_with(cx, key, &[("count", &count.to_string())]);
+            (count > 0).then(|| form::badge(text, color).debug_selector(move || selector.into()))
+        };
+        let pills = [
+            pill("structure.toAdd", added, theme.success, "structure-to-add"),
+            pill("structure.toChange", changed, theme.warning, "structure-to-change"),
+            pill("structure.toDrop", dropped, theme.danger, "structure-to-drop"),
+        ];
+        let link = problems.first().cloned().map(|first| {
+            div()
+                .id("structure-problems-link")
+                .debug_selector(|| "structure-problems-link".into())
+                .cursor_pointer()
+                .text_size(TEXT_SM)
+                .text_color(theme.danger)
+                .hover(|style| style.underline())
+                .child(t_count(cx, "structure.problems", problems.len() as i64, &[]))
+                .on_click(cx.listener(move |this, _, window, cx| this.show_problem(&first, window, cx)))
+        });
+        let drop = if focused.is_some_and(|(_, dropped)| dropped) { "structure.restore" } else { "structure.drop" };
+        h_flex()
+            .debug_selector(|| "structure-footer".into())
+            .flex_none()
+            .justify_between()
+            .px(rems(0.923))
+            .py(rems(0.615))
+            .gap(rems(0.923))
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(
+                h_flex()
+                    .gap(rems(0.462))
+                    .child(
+                        Button::new("structure-revert")
+                            .debug_selector(|| "structure-revert".into())
+                            .tool_label(t(cx, "structure.revert"))
+                            .disabled(!self.has_changes())
+                            .on_click(cx.listener(|this, _, window, cx| this.revert(window, cx))),
+                    )
+                    .child(
+                        Button::new("structure-apply")
+                            .debug_selector(|| "structure-apply".into())
+                            .primary()
+                            .tool_label(t(cx, "structure.apply"))
+                            .disabled(!self.can_apply())
+                            .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx))),
+                    )
+                    .children(pills.into_iter().flatten())
+                    .children(link),
+            )
+            .child(
+                h_flex()
+                    .gap(rems(0.462))
+                    .child(
+                        Button::new("structure-add")
+                            .debug_selector(|| "structure-add".into())
+                            .tool_icon(Icon::new(IconName::Plus), ICON_SM)
+                            .tooltip(t(cx, &format!("structure.addRow.{}", row_kind(self.section))))
+                            .disabled(!rows)
+                            .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
+                    )
+                    .child(
+                        Button::new("structure-drop")
+                            .debug_selector(|| "structure-drop".into())
+                            .tool_icon(Icon::new(IconName::Minus), ICON_SM)
+                            .tooltip(t(cx, drop))
+                            .disabled(!rows || focused.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| this.drop_focused(window, cx))),
+                    ),
+            )
+    }
+}
+
+fn row_kind(section: Section) -> &'static str {
+    match section {
+        Section::Columns | Section::Table => "column",
+        Section::Indexes => "index",
+        Section::ForeignKeys => "foreignKey",
+        Section::Checks => "check",
+    }
+}
+
+fn shown(grid: &Entity<Grid>, row: usize, column: usize, cx: &App) -> (String, Option<String>) {
+    let grid = grid.read(cx);
+    (grid.set().columns[column].name.clone(), grid.shown(row, column).display().map(str::to_string))
+}
+
+trait Listed {
+    // Its place in the loaded structure, and whether it's dropped.
+    fn state(&mut self) -> (Option<usize>, &mut bool);
+}
+
+impl Listed for ColumnRow {
+    fn state(&mut self) -> (Option<usize>, &mut bool) {
+        (self.origin, &mut self.dropped)
+    }
+}
+
+impl<T> Listed for Row<T> {
+    fn state(&mut self) -> (Option<usize>, &mut bool) {
+        (self.origin, &mut self.dropped)
+    }
+}
+
+// Marks the rows dropped, or brings them back when all of them are. An added row just goes.
+fn toggle_dropped<T: Listed>(list: &mut Vec<T>, rows: &[usize]) {
+    let mut rows: Vec<usize> = rows.iter().copied().filter(|&row| row < list.len()).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let restore = !rows.is_empty() && rows.iter().all(|&row| *list[row].state().1);
+    for &row in rows.iter().rev() {
+        let (origin, dropped) = list[row].state();
+        if origin.is_some() {
+            *dropped = !restore;
+        } else {
+            list.remove(row);
+        }
+    }
+}
+
+fn section_id(section: Section) -> &'static str {
+    match section {
+        Section::Table => "table",
+        Section::Columns => "columns",
+        Section::Indexes => "indexes",
+        Section::ForeignKeys => "foreign-keys",
+        Section::Checks => "checks",
+    }
+}
+
+fn problem_text(kind: &ProblemKind, cx: &App) -> SharedString {
+    let key = match kind {
+        ProblemKind::EmptyTableName => "emptyTableName",
+        ProblemKind::EmptyName => "emptyName",
+        ProblemKind::DuplicateName => "duplicateName",
+        ProblemKind::EmptyType => "emptyType",
+        ProblemKind::NoColumns => "noColumns",
+        ProblemKind::NoIndexColumns => "noIndexColumns",
+        ProblemKind::UsesDroppedColumn(column) => {
+            return t_with(cx, "structure.problem.usesDroppedColumn", &[("column", column)]);
+        }
+        ProblemKind::ForeignKeyColumnCount => "foreignKeyColumnCount",
+        ProblemKind::NoReferencedTable => "noReferencedTable",
+        ProblemKind::EmptyExpression => "emptyExpression",
+        ProblemKind::Unsupported => "unsupported",
+    };
+    t(cx, &format!("structure.problem.{key}"))
+}
+
+impl Render for StructureTab {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let editable = self.editable();
+        v_flex()
+            .size_full()
+            .key_context(CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &ApplyStructure, window, cx| this.apply(window, cx)))
+            .bg(theme.background)
+            .debug_selector(|| "structure-tab".into())
+            .child(self.header(window, cx))
+            .children(self.banner(cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .on_drag_move(cx.listener(|_, event: &DragMoveEvent<PreviewDrag>, window, cx| {
+                        preview::resize(event, window, cx);
+                        cx.notify();
+                    }))
+                    .child(self.body(window, cx))
+                    .when(editable, |tab| tab.child(preview::panel(self, cx))),
+            )
+            .when(editable, |tab| tab.child(self.footer(cx)))
+    }
+}

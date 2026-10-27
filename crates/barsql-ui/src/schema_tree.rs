@@ -69,6 +69,8 @@ pub enum SchemaTreeEvent {
     Browse { schema: String, table: String },
     // The ER diagram of a schema, in its own tab.
     OpenDiagram { schema: String },
+    // A table's Structure tab, or a new table's without `table`.
+    OpenStructure { schema: String, table: Option<String> },
     // SQL for another connection, like a schema comparison's sync script. Opens without running.
     OpenScript { connection: Box<ConnectionConfig>, sql: String, title: String },
     // Connect button succeeded for this connection id, so land in a tab for it.
@@ -734,6 +736,31 @@ impl SchemaTree {
         self.rebuild(cx);
     }
 
+    // After a Structure tab applied. A new table reloads the schema's list, a changed one its columns and groups.
+    pub(crate) fn structure_changed(
+        &mut self,
+        connection_id: &str,
+        schema: &str,
+        table: &str,
+        created: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if created {
+            schema::reload_tables(connection_id, schema, cx);
+            self.rebuild(cx);
+            return;
+        }
+        self.forget_groups(connection_id, schema, table, true, cx);
+        schema::reload_columns(connection_id, schema, table, cx);
+        cx.emit(SchemaTreeEvent::TableChanged {
+            connection_id: connection_id.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            change: TableChange::Altered,
+        });
+        self.rebuild(cx);
+    }
+
     // Reloads now if the group is open, `reload` is set and its connection is still shown. Otherwise it loads on
     // the next expand.
     #[allow(clippy::too_many_arguments)]
@@ -815,6 +842,8 @@ impl SchemaTree {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let this = cx.entity().downgrade();
         let writable = self.writable();
+        let creatable =
+            writable && self.connection.as_ref().is_some_and(|c| c.driver.capabilities().structure.editable);
         move |menu, _, cx| {
             let refresh = {
                 let (this, name) = (this.clone(), name.clone());
@@ -840,10 +869,18 @@ impl SchemaTree {
                     let _ = this.update(cx, |tree, cx| tree.open_schema_diff(name.clone(), window, cx));
                 }
             };
+            let new_table = {
+                let (this, schema) = (this.clone(), name.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let event = SchemaTreeEvent::OpenStructure { schema: schema.clone(), table: None };
+                    let _ = this.update(cx, |_, cx| cx.emit(event));
+                }
+            };
             menu.item(PopupMenuItem::new(t(cx, "erDiagram.menu")).on_click(diagram))
                 .item(PopupMenuItem::new(t(cx, "schemaDiff.menu")).on_click(compare))
                 .separator()
                 .item(PopupMenuItem::new(t(cx, "sidebar.refresh")).on_click(refresh))
+                .item(PopupMenuItem::new(t(cx, "sidebar.newTable")).disabled(!creatable).on_click(new_table))
                 .item(PopupMenuItem::new(t(cx, "sidebar.importIntoSchema")).disabled(!writable).on_click(import))
                 .separator()
                 .item(Self::copy_item(name.clone(), cx))
@@ -946,7 +983,11 @@ impl SchemaTree {
                     Self::view_items(menu, &this, &driver, Some((&schema, &name)), cx)
                 }
             };
+            let structure =
+                SchemaTreeEvent::OpenStructure { schema: schema_name.clone(), table: Some(table.name.clone()) };
+            let structure_label = if writable { "sidebar.editStructure" } else { "sidebar.viewStructure" };
             menu.item(PopupMenuItem::new(t(cx, "sidebar.browseData")).on_click(emit(browse)))
+                .when(is_table, |menu| menu.item(PopupMenuItem::new(t(cx, structure_label)).on_click(emit(structure))))
                 .item(PopupMenuItem::new(t(cx, "sidebar.selectInNewTab")).on_click(emit(select)))
                 .item(PopupMenuItem::new(t(cx, "sidebar.countRows")).on_click(count))
                 .when(table_views, |menu| menu.submenu(t(cx, "sidebar.systemViews"), window, cx, system_views))

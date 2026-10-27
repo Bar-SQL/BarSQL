@@ -108,6 +108,8 @@ actions!(
         ToggleValue,
         PrevChoice,
         NextChoice,
+        NextCell,
+        PrevCell,
         ApplyChanges,
         RefreshData,
     ]
@@ -154,6 +156,11 @@ pub fn init(cx: &mut App) {
         // The editor would take them, as it does with its own list of suggestions.
         KeyBinding::new("up", PrevChoice, Some(&format!("{PICKING} > Input"))),
         KeyBinding::new("down", NextChoice, Some(&format!("{PICKING} > Input"))),
+        // From a cell's editor, with or without its list, to the next cell's.
+        KeyBinding::new("tab", NextCell, Some(&format!("{CONTEXT} > Input"))),
+        KeyBinding::new("shift-tab", PrevCell, Some(&format!("{CONTEXT} > Input"))),
+        KeyBinding::new("tab", NextCell, Some(&format!("{PICKING} > Input"))),
+        KeyBinding::new("shift-tab", PrevCell, Some(&format!("{PICKING} > Input"))),
     ]);
 }
 
@@ -226,7 +233,19 @@ pub struct TableOverlay {
     pub primary: HashSet<usize>,
     // Column -> the values it takes from a list.
     pub choices: HashMap<usize, Choices>,
+    // (row, column) -> values for that cell alone, like a foreign key's referenced columns.
+    pub cell_choices: HashMap<(usize, usize), Choices>,
     pub editable: bool,
+    // Rows the owner added, shown as new.
+    pub added: HashSet<usize>,
+    // A list in its own order, like a table's structure: no sorting, filtering by value or type names.
+    pub fixed: bool,
+    // (row, column) cells the owner keeps as they are, like a generated column's.
+    pub locked: HashSet<(usize, usize)>,
+    // (row, column) cells outlined as invalid.
+    pub invalid: HashSet<(usize, usize)>,
+    // (row, column) -> icons at the cell's right edge.
+    pub marks: HashMap<(usize, usize), Vec<Lucide>>,
 }
 
 // A column's values from a fixed list: an enum's, or the ones a CHECK lists. NULL is one more where the column
@@ -235,6 +254,8 @@ pub struct TableOverlay {
 pub struct Choices {
     pub values: Arc<[String]>,
     pub nullable: bool,
+    // Typed text that names no value is taken too, so the values only suggest.
+    pub open: bool,
 }
 
 struct Editing {
@@ -300,6 +321,10 @@ struct Metrics {
     ch: Pixels,
 }
 
+fn header_height(rem: f32) -> Pixels {
+    px((rem * (0.462 * 2. + 1.385)).round() + 1.)
+}
+
 impl Metrics {
     fn new(font: &Font, window: &Window) -> Self {
         let rem = f32::from(window.rem_size());
@@ -311,7 +336,7 @@ impl Metrics {
             font_size,
             line_height: r(1.231),
             row_height: px(row_height(rem)),
-            header_height: px((rem * (0.462 * 2. + 1.385)).round() + 1.),
+            header_height: header_height(rem),
             gutter_width: r(4.),
             cell_pad_x: r(0.769),
             cell_pad_y: r(0.308),
@@ -409,6 +434,12 @@ impl Grid {
             load_armed: true,
             scrolled_to: px(0.),
         }
+    }
+
+    // From the rem size, so an owner can size the grid to its rows before it first paints.
+    pub fn fit_height(&self, window: &Window) -> Pixels {
+        let rem = f32::from(window.rem_size());
+        header_height(rem) + px(row_height(rem)) * self.order.len() as f32 + self.scroll.lanes().height
     }
 
     pub fn focused_row(&self) -> Option<RowRef> {
@@ -572,12 +603,15 @@ impl Grid {
         self.sampled = Some(want);
     }
 
-    // A fitted width makes room for the header's key icon. A dragged one is as dragged.
+    // A fitted width makes room for the header's key icon, or the most marks a cell has. A dragged one is as dragged.
     fn width_px(&self, column: usize) -> Pixels {
         match self.widths[column] {
             Width::Ch(ch) => {
-                let icon = self.key_icon(column).map_or(px(0.), |_| self.metrics.icon + self.metrics.gap);
-                (self.metrics.ch * ch as f32 + icon).round()
+                let marks = self.overlay.as_ref().and_then(|overlay| {
+                    overlay.marks.iter().filter(|((_, c), _)| *c == column).map(|(_, icons)| icons.len()).max()
+                });
+                let icons = marks.unwrap_or(0).max(usize::from(self.key_icon(column).is_some()));
+                (self.metrics.ch * ch as f32 + (self.metrics.icon + self.metrics.gap) * icons as f32).round()
             }
             Width::Px(width) => width,
         }
@@ -757,6 +791,7 @@ impl Grid {
     }
 
     fn reveal(&mut self, row: usize, col: isize) {
+        self.scroll.set_rows_height(self.metrics.row_height * self.order.len() as f32);
         let size = self.scroll.viewport().size;
         let mut position = self.scroll.position();
         let top = self.metrics.row_height * row as f32;
@@ -866,7 +901,8 @@ impl Grid {
                 let chevron_top = (m.header_height - m.chevron) / 2.;
                 let zone = if x >= width - px(RESIZE_HANDLE_PX) {
                     Zone::Resize
-                } else if x >= chevron_left
+                } else if !self.fixed()
+                    && x >= chevron_left
                     && x < chevron_left + m.chevron
                     && local.y >= chevron_top
                     && local.y < chevron_top + m.chevron
@@ -910,6 +946,7 @@ impl Grid {
         let (Some(global), Some(&column)) = (self.order.global_at(row), self.columns.get(col)) else { return false };
         self.editable()
             && !self.is_deleted(global)
+            && !self.locked(global, column)
             && copy::flag(self.shown(global, column), &self.set.columns[column].type_name).is_some()
     }
 
@@ -975,7 +1012,7 @@ impl Grid {
                     self.press = None;
                     match self.order.global_at(row) {
                         Some(global) if self.checkable(row, col) => self.toggle(global, self.columns[col], cx),
-                        Some(global) if editable => {
+                        Some(global) if editable && !self.locked(global, self.columns[col]) => {
                             self.selection.clear();
                             self.start_edit(global, self.columns[col], window, cx);
                         }
@@ -1121,6 +1158,8 @@ impl Render for Grid {
                 .bg(theme.background)
                 // Its own Cut/Copy/Paste menu, not the grid's, which would also take focus and commit the edit.
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_action(cx.listener(|this, _: &NextCell, window, cx| this.step_edit(true, window, cx)))
+                .on_action(cx.listener(|this, _: &PrevCell, window, cx| this.step_edit(false, window, cx)))
                 .when(picker.is_some(), |editor| {
                     editor
                         .key_context(PICKING)
@@ -1242,9 +1281,12 @@ struct Colors {
     staged: Hsla,
     staged_border: Hsla,
     deleted: Hsla,
+    added: Hsla,
     // A ticked checkbox's tick, on the accent, and an empty one's border.
     on_accent: Hsla,
     check_border: Hsla,
+    danger: Hsla,
+    success: Hsla,
 }
 
 // Mixes `amount` of `a` into `b`, in sRGB.
@@ -1280,9 +1322,12 @@ impl Colors {
             link: accent,
             staged: mix(theme.warning, background, 0.22),
             staged_border: theme.warning.opacity(0.55),
-            deleted: theme.danger.opacity(0.22),
+            deleted: theme.danger.opacity(0.11),
+            added: theme.success.opacity(0.22),
             on_accent: theme.primary_foreground,
             check_border: theme.muted_foreground.opacity(0.7),
+            danger: theme.danger,
+            success: theme.success,
         }
     }
 }
@@ -1351,6 +1396,21 @@ impl Shaper {
 
     // Cut with an ellipsis to fit `width`.
     fn shape(&mut self, text: &str, color: Hsla, width: Pixels, window: &Window) -> ShapedLine {
+        self.shape_run(text, color, width, None, window)
+    }
+
+    fn shape_struck(&mut self, text: &str, color: Hsla, width: Pixels, window: &Window) -> ShapedLine {
+        self.shape_run(text, color, width, Some(StrikethroughStyle { thickness: px(1.), color: Some(color) }), window)
+    }
+
+    fn shape_run(
+        &mut self,
+        text: &str,
+        color: Hsla,
+        width: Pixels,
+        strikethrough: Option<StrikethroughStyle>,
+        window: &Window,
+    ) -> ShapedLine {
         let text: SharedString = match self.wrapper.should_truncate_line(text, width, "…", TruncateFrom::End) {
             Some(ix) => format!("{}…", &text[..ix]).into(),
             None => text.to_string().into(),
@@ -1361,7 +1421,7 @@ impl Shaper {
             color,
             background_color: None,
             underline: None,
-            strikethrough: None,
+            strikethrough,
         };
         window.text_system().shape_line(text, self.size, &[run], None)
     }
@@ -1435,6 +1495,10 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
         if deleted {
             cells.quads.push(fill(row_band, colors.deleted));
         }
+        let added = grid.is_added(global);
+        if added {
+            cells.quads.push(fill(row_band, colors.added));
+        }
         for col in visible_cols.clone() {
             let column = grid.columns[col];
             let left = col_left(col);
@@ -1443,7 +1507,7 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
             let edges =
                 range::highlight(row, col, selection.range.as_ref(), &band_rows, &band_cols, rows, grid.columns.len());
             let focus_here = focus_display == Some(row) && selection.focus_col == col as isize;
-            let staged = overlay.is_some_and(|overlay| overlay.staged.contains_key(&(global, column)));
+            let staged = !added && overlay.is_some_and(|overlay| overlay.staged.contains_key(&(global, column)));
             if edges.is_some() {
                 let color = if hover_row == Some(row) { colors.selected_hover } else { colors.selected };
                 cells.quads.push(fill(cell, color));
@@ -1456,11 +1520,14 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
             let jump = overlay.is_some_and(|overlay| overlay.foreign.contains_key(&column))
                 && !value.is_null()
                 && matches!(grid.hover, Some(Target::Cell { row: r, col: c } | Target::Jump { row: r, col: c }) if r == row && c == col);
-            let text_width = width - m.cell_pad_x * 2. - if jump { m.chevron } else { px(0.) };
+            let marks = overlay.and_then(|overlay| overlay.marks.get(&(global, column))).map_or(&[][..], Vec::as_slice);
+            let marks_width = (m.icon + m.gap) * marks.len() as f32;
+            let jump_width = if jump { m.chevron } else { px(0.) };
+            let text_width = width - m.cell_pad_x * 2. - jump_width - marks_width;
             // Booleans are checkboxes in every grid. Only an editable table view's take clicks.
             if let Some(on) = copy::flag(value, &grid.set.columns[column].type_name) {
                 let check = grid.check_box(row, col);
-                if editable && !deleted {
+                if editable && !deleted && !grid.locked(global, column) {
                     checks.push(check);
                 }
                 match on {
@@ -1483,10 +1550,14 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
                     barsql_db::Cell::Number(text) => Some(shown_number(text)),
                     _ => None,
                 };
+                let shape = |shaper: &mut Shaper, text: &str, color: Hsla| match deleted {
+                    true => shaper.shape_struck(text, colors.muted, text_width, window),
+                    false => shaper.shape(text, color, text_width, window),
+                };
                 let line = match (&number, value.display()) {
-                    (Some(number), _) => plain.shape(number, colors.text, text_width, window),
-                    (None, Some(text)) => plain.shape(&display_text(text), colors.text, text_width, window),
-                    (None, None) => italic.shape(&null, colors.muted, text_width, window),
+                    (Some(number), _) => shape(&mut plain, number, colors.text),
+                    (None, Some(text)) => shape(&mut plain, &display_text(text), colors.text),
+                    (None, None) => shape(&mut italic, &null, colors.muted),
                 };
                 // Numbers line up on their decimal point, as in a spreadsheet: a shorter fraction leaves room on the
                 // right.
@@ -1509,6 +1580,15 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
                     colors.staged_border,
                     BorderStyle::Solid,
                 ));
+            }
+            if overlay.is_some_and(|overlay| overlay.invalid.contains(&(global, column))) {
+                cells.quads.push(quad(inner, px(0.), transparent_black(), px(1.), colors.danger, BorderStyle::Solid));
+            }
+            let right = left + width - m.cell_pad_x - jump_width;
+            for (ix, icon) in marks.iter().enumerate() {
+                let x = right - (m.icon + m.gap) * (marks.len() - ix) as f32 + m.gap;
+                let y = top + (m.row_height - px(1.) - m.icon) / 2.;
+                cells.icons.push((Bounds::new(point(x, y), size(m.icon, m.icon)), icon.path(), colors.muted));
             }
             if jump {
                 let button = grid.jump_box(row, col);
@@ -1578,8 +1658,16 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
         if grid.order.global_at(row).is_some_and(|global| grid.is_deleted(global)) {
             gutter.quads.push(fill(cell, colors.deleted));
         }
-        let text_color = if hovered_cell { colors.text } else { colors.muted };
-        let line = plain.shape(&(row + 1).to_string(), text_color, m.gutter_width - m.gutter_pad_x * 2., window);
+        if grid.order.global_at(row).is_some_and(|global| grid.is_added(global)) {
+            gutter.quads.push(fill(cell, colors.added));
+        }
+        let global = grid.order.global_at(row);
+        let (label, text_color) = match global {
+            Some(global) if grid.is_deleted(global) => ("\u{2212}".to_string(), colors.danger),
+            Some(global) if grid.is_added(global) => ("+".to_string(), colors.success),
+            _ => ((row + 1).to_string(), if hovered_cell { colors.text } else { colors.muted }),
+        };
+        let line = plain.shape(&label, text_color, m.gutter_width - m.gutter_pad_x * 2., window);
         let x = cell.right() - px(1.) - m.gutter_pad_x - line.width;
         gutter.texts.push((line, point(x, top + m.cell_pad_y)));
         gutter.quads.push(fill(
@@ -1646,7 +1734,7 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
         // The type follows faintly, when the name leaves room for all of it. A cut `var…` says nothing.
         let room = title_width - line.width - m.gap;
         let type_name = display_type(grid.dialect, &meta.type_name);
-        if !type_name.is_empty() && room > px(0.) && plain.fits(&type_name, room) {
+        if !grid.fixed() && !type_name.is_empty() && room > px(0.) && plain.fits(&type_name, room) {
             let type_name = plain.shape(&type_name, colors.faint, room, window);
             header.texts.push((type_name, point(title_left + line.width + m.gap, title_top)));
         }
@@ -1661,7 +1749,7 @@ fn prepaint(entity: &Entity<Grid>, bounds: Bounds<Pixels>, window: &mut Window, 
         }
         // An unsorted column shows its sort button only under the pointer, so a wide result isn't a row of chevrons.
         // The space stays reserved, so names don't shift as the pointer moves.
-        if sorted || hover.is_some() {
+        if !grid.fixed() && (sorted || hover.is_some()) {
             let icon = match (sorted, desc) {
                 (true, false) => Lucide::ChevronUp,
                 (true, true) => Lucide::ChevronDown,
@@ -1855,6 +1943,14 @@ impl Grid {
 
     pub(crate) fn is_editing(&self) -> bool {
         self.editing.is_some()
+    }
+
+    pub(crate) fn is_invalid(&self, row: usize, column: usize) -> bool {
+        self.overlay.as_ref().is_some_and(|overlay| overlay.invalid.contains(&(row, column)))
+    }
+
+    pub(crate) fn marks(&self, row: usize, column: usize) -> Vec<Lucide> {
+        self.overlay.as_ref().and_then(|overlay| overlay.marks.get(&(row, column)).cloned()).unwrap_or_default()
     }
 
     // What the open list of an enum's values holds, NULL as None, and the one Enter takes.

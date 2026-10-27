@@ -6,14 +6,14 @@ use super::driver::{Driver, open, selector};
 use crate::schema_tree::SchemaTree;
 
 // Table menu positions, counted from Browse data at 0.
-const SELECT_IN_NEW_TAB: usize = 1;
-const COUNT_ROWS: usize = 2;
-const BACKUP: usize = 4;
-const COPY_DDL: usize = 5;
-const OPEN_DDL: usize = 6;
-const RENAME: usize = 10;
-const TRUNCATE: usize = 11;
-const DROP: usize = 12;
+const SELECT_IN_NEW_TAB: usize = 2;
+const COUNT_ROWS: usize = 3;
+const BACKUP: usize = 5;
+const COPY_DDL: usize = 6;
+const OPEN_DDL: usize = 7;
+const RENAME: usize = 11;
+const TRUNCATE: usize = 12;
+const DROP: usize = 13;
 // Column menus start with Insert name and Copy name. Object menus start with Copy DDL, Open DDL and Copy name.
 const COLUMN_INSERT: usize = 0;
 const COLUMN_RENAME: usize = 2;
@@ -107,6 +107,16 @@ fn count_rows_says_how_many_without_a_tab(cx: &mut TestAppContext) {
     app.context_menu("tree:t:main.e2e_cnt", COUNT_ROWS);
     toasted(&mut app, "e2e_cnt has 2 rows");
     assert_eq!(app.titles().len(), tabs);
+}
+
+#[gpui_kit::test]
+fn a_rename_shows_its_sql_as_the_name_is_typed(cx: &mut TestAppContext) {
+    let mut app = prepared(cx, "CREATE TABLE e2e_old (id INTEGER PRIMARY KEY)");
+    app.context_menu("tree:t:main.e2e_old", RENAME);
+    app.type_text("e2e_new");
+    let shown = app.cx.update(|_, cx| cx.global::<crate::modal::ShownSql>().0.clone());
+    assert!(shown.contains("RENAME") && shown.contains("e2e_new"), "{shown}");
+    assert!(app.shown("dialog-sql"));
 }
 
 // Rename opens with the name selected, so typing replaces it.

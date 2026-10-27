@@ -1,10 +1,11 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use barsql_db::{ChunkBuilder, ColumnMeta};
 use barsql_io::ExportFormat;
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::Root;
 use gpui_kit::{
     AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
@@ -380,7 +381,7 @@ fn reactions_rows(nullable: bool, rows: usize, cx: &mut TestAppContext) -> (Enti
         builder.end_row();
     }
     let (grid, cx) = mount_with(columns, builder, cx);
-    let choices = Choices { values: ["like", "love", "wow"].map(String::from).into(), nullable };
+    let choices = Choices { values: ["like", "love", "wow"].map(String::from).into(), nullable, open: false };
     let overlay = TableOverlay { editable: true, choices: HashMap::from([(1, choices)]), ..Default::default() };
     grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
     (grid, cx)
@@ -702,4 +703,159 @@ fn enter_and_double_click_ask_to_view_the_focused_cell(cx: &mut TestAppContext) 
     });
     cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::default());
     assert_eq!(*seen.borrow(), [(1, 0), (3, 2)]);
+}
+
+// An open list only suggests: Enter takes the typed text, unless the arrows chose a value.
+#[gpui_kit::test]
+fn an_open_list_takes_the_typed_text(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (grid, cx) = reactions(false, cx);
+    let choices = Choices { values: ["like", "love", "wow"].map(String::from).into(), nullable: false, open: true };
+    let overlay = TableOverlay { editable: true, choices: HashMap::from([(1, choices)]), ..Default::default() };
+    grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
+    let edits = edits(&grid, cx);
+    cx.simulate_keystrokes("right enter l o enter");
+    cx.simulate_keystrokes("down enter l o down enter");
+    assert_eq!(*edits.borrow(), [(0, 1, Some("lo".into())), (1, 1, Some("love".into()))]);
+}
+
+// A row pushed since the last frame scrolls into view when its editor opens, as a new row's does.
+#[gpui_kit::test]
+fn a_row_pushed_since_the_last_frame_scrolls_into_view(cx: &mut TestAppContext) {
+    let (_env, grid, cx) = open(cx, 100);
+    grid.update(cx, |grid, cx| grid.set_overlay(TableOverlay { editable: true, ..Default::default() }, cx));
+    draw(cx);
+    cx.update(|window, cx| {
+        grid.update(cx, |grid, cx| {
+            grid.push(Arc::new(sample(1).finish()), cx);
+            grid.edit_cell(100, 1, window, cx);
+        })
+    });
+    let (position, viewport, row) =
+        read(&grid, cx, |g| (g.scroll.position(), g.scroll.viewport(), g.metrics.row_height));
+    assert!(position.y + viewport.size.height >= row * 101., "{position:?} {viewport:?}");
+}
+
+// A cell's own values, like a foreign key's referenced columns, win over its column's.
+#[gpui_kit::test]
+fn a_cells_own_values_win_over_its_columns(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (grid, cx) = reactions(false, cx);
+    let column = Choices { values: ["like", "love", "wow"].map(String::from).into(), nullable: false, open: false };
+    let cell = Choices { values: ["meh".to_string()].into(), nullable: false, open: false };
+    let overlay = TableOverlay {
+        editable: true,
+        choices: HashMap::from([(1, column)]),
+        cell_choices: HashMap::from([((1, 1), cell)]),
+        ..Default::default()
+    };
+    grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
+    cx.simulate_keystrokes("right enter");
+    assert_eq!(picker(&grid, cx), Some((kinds(&["like", "love", "wow"]), 0)));
+    cx.simulate_keystrokes("escape down enter");
+    assert_eq!(picker(&grid, cx), Some((kinds(&["meh"]), 0)));
+}
+
+// Cells the owner marks invalid, and the icons it puts on cells, are the overlay's.
+#[gpui_kit::test]
+fn invalid_cells_and_marks_come_from_the_overlay(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (grid, cx) = reactions(false, cx);
+    let overlay = TableOverlay {
+        editable: true,
+        invalid: HashSet::from([(1, 1)]),
+        marks: HashMap::from([((0, 1), vec![Lucide::Link, Lucide::ListTree])]),
+        ..Default::default()
+    };
+    grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
+    assert!(read(&grid, cx, |g| g.is_invalid(1, 1) && !g.is_invalid(0, 1)));
+    assert_eq!(read(&grid, cx, |g| g.marks(0, 1)), [Lucide::Link, Lucide::ListTree]);
+    assert!(read(&grid, cx, |g| g.marks(1, 1)).is_empty());
+}
+
+// Tab moves the editor along the row past checkboxes and locked cells, Shift+Tab back, and at the end only commits.
+#[gpui_kit::test]
+fn tab_moves_the_editor_along_the_row(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let columns: Arc<[ColumnMeta]> = [("name", "TEXT"), ("active", "BOOLEAN"), ("note", "TEXT"), ("extra", "TEXT")]
+        .map(|(name, type_name)| ColumnMeta { name: name.into(), type_name: type_name.into() })
+        .to_vec()
+        .into();
+    let mut builder = ChunkBuilder::new(4, 1);
+    builder.push_text(|s| s.push_str("ann"));
+    builder.push_number(|s| s.push('1'));
+    builder.push_text(|s| s.push('n'));
+    builder.push_text(|s| s.push('x'));
+    builder.end_row();
+    let (grid, cx) = mount_with(columns, builder, cx);
+    let overlay = TableOverlay { editable: true, locked: HashSet::from([(0, 3)]), ..Default::default() };
+    grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
+    let edits = edits(&grid, cx);
+    cx.simulate_keystrokes("enter x tab y tab");
+    assert_eq!(*edits.borrow(), [(0, 0, Some("annx".into())), (0, 2, Some("ny".into()))]);
+    assert!(!read(&grid, cx, |g| g.is_editing()), "the locked last cell takes no editor");
+    cx.simulate_keystrokes("enter shift-tab escape");
+    assert_eq!(edits.borrow().last(), Some(&(0, 2, Some("n".into()))));
+    assert_eq!(read(&grid, cx, |g| (g.focused_cell(), g.is_editing())), (Some((0, 0)), false));
+}
+
+// An owner can size the grid to its rows before it first paints: the header and every row, as they're painted.
+#[gpui_kit::test]
+fn the_fit_height_is_the_header_and_rows(cx: &mut TestAppContext) {
+    let (_env, grid, cx) = open(cx, 3);
+    let fit = cx.update(|window, cx| grid.read(cx).fit_height(window));
+    draw(cx);
+    let m = read(&grid, cx, |g| g.metrics);
+    assert_eq!(fit, m.header_height + m.row_height * 3.);
+}
+
+// A fitted column makes room for its cells' marks beside its text, as it does for a header's key icon.
+#[gpui_kit::test]
+fn a_fitted_column_makes_room_for_its_marks(cx: &mut TestAppContext) {
+    let (_env, grid, cx) = open(cx, 3);
+    draw(cx);
+    let plain = read(&grid, cx, |g| g.col_x[2] - g.col_x[1]);
+    let marks = HashMap::from([((0, 1), vec![Lucide::Link, Lucide::ListTree])]);
+    grid.update(cx, |grid, cx| grid.set_overlay(TableOverlay { marks, ..Default::default() }, cx));
+    draw(cx);
+    let (marked, m) = read(&grid, cx, |g| (g.col_x[2] - g.col_x[1], g.metrics));
+    assert_eq!(marked, plain + (m.icon + m.gap) * 2.);
+}
+
+// A locked cell keeps its value: its checkbox doesn't flip and Enter opens no editor, where the next row's does.
+#[gpui_kit::test]
+fn a_locked_cell_does_not_edit(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (grid, cx) = booleans(cx);
+    let locked = HashSet::from([(0, 0), (0, 1)]);
+    grid.update(cx, |grid, cx| grid.set_overlay(TableOverlay { editable: true, locked, ..Default::default() }, cx));
+    let edits = edits(&grid, cx);
+    let at = read(&grid, cx, |g| g.check_point(0, 1));
+    cx.simulate_click(at, Modifiers::none());
+    cx.simulate_keystrokes("space left enter");
+    assert!(!read(&grid, cx, |g| g.is_editing()), "no editor opens");
+    cx.simulate_keystrokes(&format!("{}-delete down enter x enter", modifier()));
+    assert_eq!(*edits.borrow(), [(1, 0, Some("2x".into()))]);
+}
+
+// A fixed list keeps its order, so its header chevrons don't sort.
+#[gpui_kit::test]
+fn a_fixed_list_does_not_sort(cx: &mut TestAppContext) {
+    let _env = Env::new(cx);
+    let (grid, cx) = reactions(false, cx);
+    let overlay = TableOverlay { editable: true, fixed: true, ..Default::default() };
+    grid.update(cx, |grid, cx| grid.set_overlay(overlay, cx));
+    let sorts = Rc::new(RefCell::new(0));
+    let sink = sorts.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&grid, move |_, event: &GridEvent, _| {
+            if matches!(event, GridEvent::SortRequested(_) | GridEvent::SortTo(_)) {
+                *sink.borrow_mut() += 1;
+            }
+        })
+        .detach()
+    });
+    let chevron = header_chevron(&grid, 0, cx);
+    cx.simulate_click(chevron, Modifiers::default());
+    assert_eq!(*sorts.borrow(), 0);
 }

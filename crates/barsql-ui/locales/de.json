@@ -143,6 +143,9 @@
     "planHideQuiet": "0 und false ausblenden"
   },
   "sidebar": {
+    "newTable": "Neue Tabelle…",
+    "editStructure": "Struktur bearbeiten…",
+    "viewStructure": "Struktur anzeigen",
     "badge": {
       "matview": "MATVIEW"
     },
@@ -224,6 +227,7 @@
     "showAllColumns": "Alle Spalten einblenden"
   },
   "tableView": {
+    "structure": "Struktur",
     "markRows": "{{count}} Zeile zum Löschen markieren",
     "markRows_other": "{{count}} Zeilen zum Löschen markieren",
     "unmarkRows": "Löschmarkierung von {{count}} Zeile entfernen",
@@ -279,6 +283,8 @@
     "exportStopped_other": "Export abgebrochen - {{fileName}} enthält nur die ersten {{count}} Zeilen"
   },
   "menu": {
+    "editTableStructure": "Tabellenstruktur bearbeiten",
+    "newTable": "Neue Tabelle",
     "toggleSidebar": "Seitenleiste",
     "toggleJsonPanel": "JSON-Viewer",
     "undo": "Widerrufen",
@@ -445,5 +451,103 @@
     "license": "Lizenz {{name}}",
     "madeWith": "Erstellt mit",
     "checkUpdates": "Nach Updates suchen"
+  },
+  "structure": {
+    "foreignKey": {
+      "name": "Name",
+      "columns": "Spalten",
+      "table": "Verweist auf",
+      "refColumns": "Referenzierte Spalten",
+      "onUpdate": "Bei Änderung",
+      "onDelete": "Beim Löschen"
+    },
+    "action": {
+      "noAction": "Keine Aktion",
+      "restrict": "Verhindern",
+      "cascade": "Weitergeben",
+      "setNull": "Auf NULL setzen",
+      "setDefault": "Auf Standardwert setzen"
+    },
+    "check": {
+      "name": "Name",
+      "expression": "Bedingung"
+    },
+    "index": {
+      "name": "Name",
+      "columns": "Spalten",
+      "unique": "Eindeutig",
+      "method": "Methode",
+      "definition": "Definition",
+      "constraint": "Constraint"
+    },
+    "discardTitle": "Strukturänderungen verwerfen?",
+    "discardDescription_one": "Ein Tab hat Strukturänderungen, die nicht angewendet wurden. Beim Schließen gehen sie verloren.",
+    "discardDescription_other": "{{count}} Tabs haben Strukturänderungen, die nicht angewendet wurden. Beim Schließen gehen sie verloren.",
+    "discardConfirm": "Änderungen verwerfen",
+    "newTableTitle": "Neue Tabelle",
+    "tableName": "Tabellenname",
+    "tableNamePlaceholder": "z. B. customers",
+    "applyTitle": "Strukturänderungen anwenden",
+    "applyConfirm": "Anwenden",
+    "applied": "Struktur von {{name}} geändert",
+    "rebuildWarning": "SQLite kann das nicht direkt ändern, daher wird die Tabelle neu aufgebaut und ihre Zeilen werden kopiert.",
+    "notAtomicWarning": "Diese Datenbank kann Schemaänderungen nicht rückgängig machen: Schlägt eine Anweisung fehl, bleiben die vorherigen bestehen.",
+    "gone": "Diese Tabelle existiert nicht mehr.",
+    "stale": "Die Tabelle wurde anderswo geändert. Neu laden, um sie zu sehen – die Änderungen hier gehen dabei verloren.",
+    "reload": "Neu laden",
+    "addRow": {
+      "column": "Spalte hinzufügen",
+      "index": "Index hinzufügen",
+      "foreignKey": "Fremdschlüssel hinzufügen",
+      "check": "Check hinzufügen"
+    },
+    "revert": "Verwerfen",
+    "apply": "Anwenden",
+    "toAdd": "{{count}} hinzuzufügen",
+    "toChange": "{{count}} zu ändern",
+    "toDrop": "{{count}} zu löschen",
+    "preview": "SQL-Vorschau",
+    "statements_one": "{{count}} Anweisung",
+    "statements_other": "{{count}} Anweisungen",
+    "oneTransaction": "eine Transaktion",
+    "primaryKey": "Schlüssel",
+    "drop": "Löschen",
+    "restore": "Wiederherstellen",
+    "problem": {
+      "emptyTableName": "Tabellennamen eingeben",
+      "emptyName": "Namen eingeben",
+      "duplicateName": "Dieser Name ist schon vergeben",
+      "emptyType": "Typ wählen",
+      "noColumns": "Eine Tabelle braucht mindestens eine Spalte",
+      "noIndexColumns": "Spalten für den Index wählen",
+      "usesDroppedColumn": "Verwendet {{column}}, die gelöscht wird",
+      "foreignKeyColumnCount": "So viele Spalten angeben, wie referenziert werden",
+      "noReferencedTable": "Referenzierte Tabelle wählen",
+      "emptyExpression": "Bedingung eingeben",
+      "unsupported": "Diese Datenbank kann das nicht ändern"
+    },
+    "columns": "Spalten",
+    "indexes": "Indizes",
+    "foreignKeys": "Fremdschlüssel",
+    "checks": "Checks",
+    "loadFailed": "Die Struktur der Tabelle konnte nicht geladen werden",
+    "retry": "Erneut versuchen",
+    "name": "Name",
+    "type": "Typ",
+    "nullable": "NULL erlaubt",
+    "default": "Standardwert",
+    "comment": "Kommentar",
+    "generated": "Generiert:",
+    "problemRow": "Zeile {{row}}: {{problem}}",
+    "problems_one": "{{count}} Problem",
+    "problems_other": "{{count}} Probleme",
+    "identity": {
+      "label": "Identität",
+      "none": "Keine",
+      "byDefault": "Identität, standardmäßig",
+      "always": "Identität, immer",
+      "autoIncrement": "Auto-Inkrement",
+      "seeded": "Identität ({{seed}}, {{increment}})"
+    }
   }
 }
